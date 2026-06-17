@@ -1,0 +1,18 @@
+# ESP-IDF build output
+/build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+*.bin
+*.elf
+*.map
+
+# Component manager downloads (re-fetched by `idf.py`)
+/managed_components/
+
+# macOS
+.DS_Store
+
+# build logs
+fw-build.log
+fw-flash.log
