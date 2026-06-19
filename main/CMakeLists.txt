@@ -23,9 +23,20 @@ else()
     message(FATAL_ERROR "Unsupported Xtensa target: ${target}")
 endif()
 
-set(SWIFTC "${CMAKE_CURRENT_SOURCE_DIR}/../../install/bin/swiftc")
-if(NOT EXISTS "${SWIFTC}")
-    message(FATAL_ERROR "Custom Swift compiler not found at:\n  ${SWIFTC}")
+# Locate the custom Xtensa Embedded-Swift toolchain (install/ in the workspace).
+# Robust to where this project sits in the tree; override -DSWIFTC=... if needed.
+set(SWIFTC "")
+foreach(cand
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../install/bin/swiftc"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../install/bin/swiftc"
+        "$ENV{HOME}/Desktop/swift-xtensa-esp32/install/bin/swiftc")
+    if(EXISTS "${cand}")
+        set(SWIFTC "${cand}")
+        break()
+    endif()
+endforeach()
+if(SWIFTC STREQUAL "")
+    message(FATAL_ERROR "Custom Swift (Xtensa) compiler not found; pass -DSWIFTC=/path/to/install/bin/swiftc")
 endif()
 message(STATUS "Embedded Swift Firmata port: ${SWIFTC}  ->  ${SWIFT_TARGET_TRIPLE}")
 

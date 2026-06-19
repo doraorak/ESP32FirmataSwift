@@ -1,16 +1,18 @@
 //===----------------------------------------------------------------------===//
-// firmata_shim.cpp — C/C++ interop layer for the Embedded-Swift Firmata port.
+// firmata_shim.cpp — BRIDGING ONLY.
 //
-// The Firmata protocol, Scheduler and the register/if-else logic live in
-// Main.swift. This file is only the parts that can't be Embedded Swift: the
-// Arduino peripheral APIs (pinMode / Wire / Serial / LEDC via analogWrite) and
-// BOTH transports from the original ESP32Firmata.ino — Wi-Fi/TCP + Bonjour AND
-// BLE (Nordic UART Service) — with the same latest-wins arbitration. It calls
-// into Swift for every protocol decision (the sw_* entry points).
+// No implementation logic lives here. Every function is a thin wrapper over a
+// vendor (Arduino / ESP-IDF) API so Embedded Swift can reach it. The protocol,
+// Scheduler, logic extension, transport orchestration (Wi-Fi/Bonjour/TCP + BLE),
+// arbitration and the main loop are all in Main.swift.
 //
-// digitalWrite / digitalRead / analogRead / analogWrite are Arduino's own
-// extern "C" HAL functions; Swift calls them directly (declared in
-// BridgingHeader.h) — no wrappers here.
+// Two things are unavoidably C++ and are kept to pure forwarding:
+//   * BLE callback classes — Swift can't subclass a C++ class, so these just
+//     push bytes into a FIFO / set event flags that Swift polls.
+//   * `app_main` — the ESP-IDF entry; it inits Arduino and calls Swift `sw_main`.
+//
+// String arguments are passed from Swift as `const uint8_t*` (StaticString /
+// byte buffers) and cast to `char*` here.
 //===----------------------------------------------------------------------===//
 #include "Arduino.h"
 #include "WiFi.h"
@@ -21,52 +23,28 @@
 #include "BLEUtils.h"
 #include "BLE2902.h"
 
-// --- USER CONFIGURATION (from ESP32Firmata.ino) ----------------------------
-#define WIFI_SSID        "YOUR_WIFI_SSID"
-#define WIFI_PASS        "YOUR_WIFI_PASSWORD"
-#define MDNS_HOSTNAME    "esp32-firmata"
-#define FIRMATA_TCP_PORT 3030
-#define BLE_DEVICE_NAME  "Firmata-ESP32"
+extern "C" void sw_main(void);   // Swift owns all logic + the run loop
 
 // ===========================================================================
-//  Swift entry points (implemented in Main.swift, @_cdecl)
+//  Time / GPIO / ADC / Serial  (Arduino HAL passthroughs)
 // ===========================================================================
 extern "C" {
-  void sw_system_reset(void);
-  void sw_claim_master_tcp(void);
-  void sw_claim_master_ble(void);
-  void sw_tcp_disconnected(void);
-  void sw_ble_disconnected(void);
-  void sw_process_live_byte(uint8_t b);
-  void sw_loop_tick(void);
-}
-
-// ===========================================================================
-//  Peripheral shims called from Swift (declared in BridgingHeader.h)
-// ===========================================================================
-extern "C" {
-
-void fm_analog_setup(void) {
+void         fm_serial_begin(unsigned baud) { Serial.begin(baud); }
+void         fm_log(const uint8_t *s)       { Serial.println((const char *)s); }
+void         fm_analog_setup(void) {
   analogReadResolution(12);
 #if defined(ADC_11db)
   analogSetAttenuation(ADC_11db);
 #endif
 }
-
-// pin mode helper (Arduino INPUT/OUTPUT/INPUT_PULLUP macros differ from Firmata's)
-void fm_pin_mode(int pin, int mode) {   // 0=INPUT 1=OUTPUT 2=INPUT_PULLUP
-  switch (mode) {
-    case 1: pinMode((uint8_t)pin, OUTPUT);       break;
-    case 2: pinMode((uint8_t)pin, INPUT_PULLUP); break;
-    default: pinMode((uint8_t)pin, INPUT);       break;
-  }
+void         fm_pin_mode(int pin, int mode) {   // 0=INPUT 1=OUTPUT 2=INPUT_PULLUP
+  pinMode((uint8_t)pin, mode == 1 ? OUTPUT : (mode == 2 ? INPUT_PULLUP : INPUT));
 }
+unsigned     fm_millis(void)             { return (unsigned)millis(); }
+void         fm_delay_ms(unsigned m)     { delay(m); }
+void         fm_delay_us(unsigned u)     { delayMicroseconds(u); }
 
-unsigned int fm_millis(void)             { return (unsigned int)millis(); }
-void         fm_delay_ms(unsigned int m) { delay(m); }
-void         fm_delay_us(unsigned int u) { delayMicroseconds(u); }
-
-// --- I2C (Wire) ---
+// I2C (Wire)
 void fm_i2c_begin(int sda, int scl)       { Wire.begin((uint8_t)sda, (uint8_t)scl); }
 void fm_i2c_begin_transmission(int addr)  { Wire.beginTransmission((uint8_t)addr); }
 void fm_i2c_write(int b)                  { Wire.write((uint8_t)b); }
@@ -75,140 +53,97 @@ int  fm_i2c_request_from(int addr, int n) { return Wire.requestFrom(addr, n); }
 int  fm_i2c_available(void)               { return Wire.available(); }
 int  fm_i2c_read(void)                    { return Wire.read(); }
 
-// --- Serial logging ---
-void fm_log(const char *s) { Serial.println(s); }
-void fm_log_host(const uint8_t *bytes, int n) {
-  String s;
-  for (int i = 0; i + 1 < n; i += 2) {
-    uint16_t cp = (bytes[i] & 0x7F) | ((bytes[i + 1] & 0x7F) << 7);
-    if (cp < 128) s += (char)cp;
-  }
-  Serial.print("[host] "); Serial.println(s);
-}
-
-} // extern "C"
-
 // ===========================================================================
-//                     TRANSPORT — Wi-Fi / Bonjour (faithful to the .ino)
+//  Wi-Fi / mDNS  (each call is one vendor API; Swift sequences them)
 // ===========================================================================
-static WiFiServer tcpServer(FIRMATA_TCP_PORT);
-static WiFiClient tcpClient;
-static bool       wifiReady = false;
-
-static int buildEvictionFrame(uint8_t *out) {   // STRING_DATA 0x01 "EVICTED"
-  static const char *s = "\x01" "EVICTED";
-  int n = 0;
-  out[n++] = 0xF0; out[n++] = 0x71;
-  for (const char *p = s; *p; ++p) { out[n++] = (uint8_t)(*p) & 0x7F; out[n++] = ((uint8_t)(*p) >> 7) & 0x7F; }
-  out[n++] = 0xF7;
-  return n;
-}
-
-extern "C" void fm_tcp_send(const uint8_t *buf, int len) {
-  if (tcpClient && tcpClient.connected()) tcpClient.write(buf, (size_t)len);
-}
-extern "C" void fm_tcp_drop(void) {
-  if (tcpClient && tcpClient.connected()) { tcpClient.stop(); Serial.println("Evicted TCP client (latest-wins)"); }
-}
-
-static void startBonjour() {
-  MDNS.end();
-  if (!MDNS.begin(MDNS_HOSTNAME)) { Serial.println("mDNS start failed"); return; }
-  MDNS.addService("firmata", "tcp", FIRMATA_TCP_PORT);
-  String ip = WiFi.localIP().toString();
-  MDNS.addServiceTxt("firmata", "tcp", "ip",   ip.c_str());
-  MDNS.addServiceTxt("firmata", "tcp", "port", String(FIRMATA_TCP_PORT).c_str());
-  Serial.printf("Bonjour: _firmata._tcp on %s:%d (instance \"%s\")\n", ip.c_str(), FIRMATA_TCP_PORT, MDNS_HOSTNAME);
-}
-static void startTcpServices() {
-  startBonjour();
-  tcpServer.begin();
-  tcpServer.setNoDelay(true);
-  wifiReady = true;
-  Serial.print("Wi-Fi up. IP = "); Serial.println(WiFi.localIP());
-}
-static void tcpInit() {
+void fm_wifi_begin(const uint8_t *ssid, const uint8_t *pass, const uint8_t *host) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.setHostname(MDNS_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("Connecting to Wi-Fi \"%s\"", WIFI_SSID);
-  uint8_t tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 40) { delay(400); Serial.print('.'); tries++; }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) startTcpServices();
-  else Serial.println("Wi-Fi not up yet (BLE still available, will retry).");
+  WiFi.setHostname((const char *)host);
+  WiFi.begin((const char *)ssid, (const char *)pass);
 }
-static void tcpPoll() {
-  if (WiFi.status() != WL_CONNECTED) { if (wifiReady) { wifiReady = false; Serial.println("Wi-Fi lost"); } return; }
-  if (!wifiReady) startTcpServices();
-  WiFiClient incoming = tcpServer.available();
-  if (incoming) {
-    if (tcpClient && tcpClient.connected()) { uint8_t nb[24]; tcpClient.write(nb, buildEvictionFrame(nb)); tcpClient.stop(); }
-    tcpClient = incoming; tcpClient.setNoDelay(true);
-    Serial.println("TCP client connected");
-    sw_claim_master_tcp();
-  }
-  if (!tcpClient || !tcpClient.connected()) sw_tcp_disconnected();
-  for (int g = 0; tcpClient && tcpClient.available() && g < 1024; g++) sw_process_live_byte((uint8_t)tcpClient.read());
+int  fm_wifi_connected(void) { return WiFi.status() == WL_CONNECTED ? 1 : 0; }
+int  fm_wifi_localip(uint8_t *out, int n) {
+  String s = WiFi.localIP().toString();
+  strncpy((char *)out, s.c_str(), n - 1); out[n - 1] = 0;
+  return (int)strlen((char *)out);
+}
+int  fm_mdns_begin(const uint8_t *host) { MDNS.end(); return MDNS.begin((const char *)host) ? 1 : 0; }
+void fm_mdns_add_service(const uint8_t *svc, const uint8_t *proto, int port) {
+  MDNS.addService((const char *)svc, (const char *)proto, port);
+}
+void fm_mdns_add_txt(const uint8_t *svc, const uint8_t *proto, const uint8_t *k, const uint8_t *v) {
+  MDNS.addServiceTxt((const char *)svc, (const char *)proto, (const char *)k, (const char *)v);
 }
 
 // ===========================================================================
-//                     TRANSPORT — BLE (Nordic UART Service, faithful to .ino)
+//  TCP server / client  (one vendor op each; Swift drives accept/read/write)
+// ===========================================================================
+} // extern "C"
+static WiFiServer *tcpServer = nullptr;
+static WiFiClient  tcpClient;
+static WiFiClient  tcpIncoming;
+extern "C" {
+void fm_tcp_begin(int port)   { if (!tcpServer) tcpServer = new WiFiServer((uint16_t)port);
+                                tcpServer->begin(); tcpServer->setNoDelay(true); }
+int  fm_tcp_poll_new(void)    { if (!tcpServer) return 0; WiFiClient c = tcpServer->available();
+                                if (c) { tcpIncoming = c; return 1; } return 0; }
+void fm_tcp_promote(void)     { tcpClient = tcpIncoming; tcpClient.setNoDelay(true); }
+int  fm_tcp_connected(void)   { return (tcpClient && tcpClient.connected()) ? 1 : 0; }
+int  fm_tcp_available(void)   { return (tcpClient && tcpClient.connected()) ? tcpClient.available() : 0; }
+int  fm_tcp_read(void)        { return tcpClient.read(); }
+void fm_tcp_write(const uint8_t *b, int n) { if (tcpClient && tcpClient.connected()) tcpClient.write(b, (size_t)n); }
+void fm_tcp_drop(void)        { if (tcpClient && tcpClient.connected()) tcpClient.stop(); }
+} // extern "C"
+
+// ===========================================================================
+//  BLE Nordic UART Service.
+//  Callbacks are pure forwarders into a FIFO / event flags that Swift polls —
+//  no protocol/transport logic here. (Swift can't subclass these C++ classes.)
 // ===========================================================================
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // host -> device
-#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // device -> host
+#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 static BLEServer         *bleServer = nullptr;
 static BLECharacteristic *txChar    = nullptr;
 static volatile bool      bleConnected = false;
 static volatile uint16_t  bleConnId   = 0;
-static volatile bool      bleNewConnect = false;
-static bool               bleWasConnected = false;
-static volatile uint16_t  negotiatedMTU = 23;
+static volatile bool      connectEvt = false, disconnectEvt = false;
+static volatile uint16_t  negMTU = 23;
 
-static const int RXBUF_SIZE = 2048;
-static volatile uint8_t  rxbuf[RXBUF_SIZE];
-static volatile int      rxHead = 0, rxTail = 0;
-static portMUX_TYPE      rxMux = portMUX_INITIALIZER_UNLOCKED;
-
-static void rxEnqueue(const uint8_t *d, size_t n) {
-  portENTER_CRITICAL(&rxMux);
-  for (size_t i = 0; i < n; i++) { int nh = (rxHead + 1) % RXBUF_SIZE; if (nh != rxTail) { rxbuf[rxHead] = d[i]; rxHead = nh; } }
-  portEXIT_CRITICAL(&rxMux);
-}
-static int rxDequeue() {
-  int r = -1;
-  portENTER_CRITICAL(&rxMux);
-  if (rxTail != rxHead) { r = rxbuf[rxTail]; rxTail = (rxTail + 1) % RXBUF_SIZE; }
-  portEXIT_CRITICAL(&rxMux);
-  return r;
-}
+static const int RXSZ = 2048;
+static volatile uint8_t   rxb[RXSZ];
+static volatile int       rxh = 0, rxt = 0;
+static portMUX_TYPE       rxMux = portMUX_INITIALIZER_UNLOCKED;
 
 class RxCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) override {
+  void onWrite(BLECharacteristic *c) override {        // forward bytes to FIFO
     uint8_t *d = c->getData(); size_t n = c->getLength();
-    if (d && n) rxEnqueue(d, n);
+    if (!d || !n) return;
+    portENTER_CRITICAL(&rxMux);
+    for (size_t i = 0; i < n; i++) { int nh = (rxh + 1) % RXSZ; if (nh != rxt) { rxb[rxh] = d[i]; rxh = nh; } }
+    portEXIT_CRITICAL(&rxMux);
   }
 };
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
-    uint16_t newConn = param->connect.conn_id;
-    if (bleConnected && bleConnId != newConn) s->disconnect(bleConnId);   // latest-wins
-    bleConnId = newConn; bleConnected = true; bleNewConnect = true;
+  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *p) override {
+    uint16_t nc = p->connect.conn_id;
+    if (bleConnected && bleConnId != nc) s->disconnect(bleConnId);   // vendor conn mgmt (newest only)
+    bleConnId = nc; bleConnected = true; connectEvt = true;
     s->startAdvertising();
   }
-  void onDisconnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
-    if (param->disconnect.conn_id == bleConnId) { bleConnected = false; negotiatedMTU = 23; }
+  void onDisconnect(BLEServer *s, esp_ble_gatts_cb_param_t *p) override {
+    if (p->disconnect.conn_id == bleConnId) { bleConnected = false; negMTU = 23; disconnectEvt = true; }
     s->startAdvertising();
   }
-  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) override { negotiatedMTU = param->mtu.mtu; }
+  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *p) override { negMTU = p->mtu.mtu; }
 };
 
-static void bleInit() {
-  BLEDevice::init(BLE_DEVICE_NAME);
+extern "C" {
+void fm_ble_begin(const uint8_t *name) {
+  BLEDevice::init((const char *)name);
   BLEDevice::setMTU(517);
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
@@ -221,52 +156,30 @@ static void bleInit() {
   svc->start();
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   BLEAdvertisementData advData;  advData.setFlags(0x06);  advData.setCompleteServices(BLEUUID(NUS_SERVICE_UUID));
-  BLEAdvertisementData scanResp; scanResp.setName(BLE_DEVICE_NAME);
+  BLEAdvertisementData scanResp; scanResp.setName((const char *)name);
   adv->setAdvertisementData(advData); adv->setScanResponseData(scanResp);
   adv->setMinPreferred(0x06); adv->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
-  Serial.printf("BLE advertising as \"%s\" (Nordic UART Service)\n", BLE_DEVICE_NAME);
 }
-
-extern "C" void fm_ble_drop(void) {
-  if (bleConnected && bleServer) { bleServer->disconnect(bleConnId); Serial.println("Evicted BLE central (latest-wins)"); }
-}
-extern "C" void fm_ble_send(const uint8_t *buf, int len) {
+int  fm_ble_connected(void)      { return bleConnected ? 1 : 0; }
+int  fm_ble_mtu(void)            { return (int)negMTU; }
+void fm_ble_notify(const uint8_t *b, int n) {                 // one notification (Swift chunks)
   if (!bleConnected || !txChar) return;
-  size_t chunk = (negotiatedMTU > 23) ? (size_t)(negotiatedMTU - 3) : 20;
-  size_t off = 0;
-  while (off < (size_t)len) {
-    size_t n = ((size_t)len - off < chunk) ? ((size_t)len - off) : chunk;
-    txChar->setValue((uint8_t *)(buf + off), n);
-    txChar->notify();
-    off += n;
-    if (off < (size_t)len) delay(6);
-  }
+  txChar->setValue((uint8_t *)b, (size_t)n); txChar->notify();
 }
-static void blePoll() {
-  if (bleNewConnect) { bleNewConnect = false; bleWasConnected = true; Serial.println("BLE central connected"); sw_claim_master_ble(); }
-  else if (!bleConnected && bleWasConnected) { bleWasConnected = false; sw_ble_disconnected(); Serial.println("BLE central disconnected"); }
-  int b, g = 0;
-  while ((b = rxDequeue()) >= 0 && g++ < 4096) sw_process_live_byte((uint8_t)b);
+void fm_ble_drop(void)           { if (bleConnected && bleServer) bleServer->disconnect(bleConnId); }
+int  fm_ble_poll_connect(void)   { if (connectEvt)    { connectEvt = false;    return 1; } return 0; }
+int  fm_ble_poll_disconnect(void){ if (disconnectEvt) { disconnectEvt = false; return 1; } return 0; }
+int  fm_ble_rx_pop(void) {
+  int r = -1;
+  portENTER_CRITICAL(&rxMux);
+  if (rxt != rxh) { r = rxb[rxt]; rxt = (rxt + 1) % RXSZ; }
+  portEXIT_CRITICAL(&rxMux);
+  return r;
 }
 
 // ===========================================================================
-//  Arduino entry points (AUTOSTART_ARDUINO = n; we drive them)
+//  ESP-IDF entry — init Arduino, hand everything to Swift.
 // ===========================================================================
-extern "C" void app_main(void) {
-  initArduino();
-  Serial.begin(115200);
-  delay(200);
-  Serial.println();
-  Serial.println("=== ESP32 Firmata (Embedded Swift) : FirmataESP32 ===");
-  fm_analog_setup();
-  sw_system_reset();
-  tcpInit();
-  bleInit();
-  for (;;) {
-    tcpPoll();
-    blePoll();
-    sw_loop_tick();
-    delay(1);
-  }
-}
+void app_main(void) { initArduino(); sw_main(); }
+} // extern "C"

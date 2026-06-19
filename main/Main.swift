@@ -185,9 +185,10 @@ var activeTransport: UInt8 = TR_NONE
 //  Outgoing frame transport (routes to the current master)
 // ===========================================================================
 func sendFrame(_ buf: [UInt8], _ len: Int) {
-  buf.withUnsafeBufferPointer { bp in
-    if activeTransport == TR_TCP { fm_tcp_send(bp.baseAddress, Int32(len)) }
-    else if activeTransport == TR_BLE { fm_ble_send(bp.baseAddress, Int32(len)) }
+  if activeTransport == TR_TCP {
+    buf.withUnsafeBufferPointer { fm_tcp_write($0.baseAddress, Int32(len)) }
+  } else if activeTransport == TR_BLE {
+    bleSend(buf, len)
   }
 }
 
@@ -454,7 +455,15 @@ func handleI2CRequest(_ data: [UInt8], _ len: Int) {
 //  SysEx dispatch
 // ===========================================================================
 func handleString(_ data: [UInt8], _ len: Int) {
-  data.withUnsafeBufferPointer { bp in fm_log_host(bp.baseAddress, Int32(len)) }
+  var s = [UInt8](repeating: 0, count: len / 2 + 1)
+  var j = 0, i = 0
+  while i + 1 < len {
+    let cp = Int(data[i] & 0x7F) | (Int(data[i + 1] & 0x7F) << 7)
+    if cp < 128 { s[j] = UInt8(cp); j += 1 }
+    i += 2
+  }
+  s[j] = 0
+  s.withUnsafeBufferPointer { fm_log($0.baseAddress) }
 }
 
 func processSysex(_ buf: [UInt8], _ len: Int) {
@@ -857,17 +866,9 @@ func claimMaster(_ who: UInt8) {
 func transportConnected() -> Bool { activeTransport != TR_NONE }
 
 // ===========================================================================
-//  Entry points called from firmata_shim.cpp (C++ transport / Arduino loop)
+//  Periodic work (scheduler + sampling), run each loop iteration
 // ===========================================================================
-@_cdecl("sw_system_reset")     public func sw_system_reset()      { systemResetState() }
-@_cdecl("sw_claim_master_tcp") public func sw_claim_master_tcp()  { claimMaster(TR_TCP) }
-@_cdecl("sw_claim_master_ble") public func sw_claim_master_ble()  { claimMaster(TR_BLE) }
-@_cdecl("sw_tcp_disconnected") public func sw_tcp_disconnected()  { if activeTransport == TR_TCP { activeTransport = TR_NONE } }
-@_cdecl("sw_ble_disconnected") public func sw_ble_disconnected()  { if activeTransport == TR_BLE { activeTransport = TR_NONE } }
-@_cdecl("sw_process_live_byte") public func sw_process_live_byte(_ b: UInt8) { processByte(&liveParser, b) }
-
-@_cdecl("sw_loop_tick")
-public func sw_loop_tick() {
+func loopTick() {
   schedTick()
   if transportConnected() {
     checkDigitalInputs()
@@ -876,5 +877,127 @@ public func sw_loop_tick() {
       lastSampleMs = now
       sampleAnalogAndI2C()
     }
+  }
+}
+
+// ===========================================================================
+//  User configuration
+// ===========================================================================
+let WIFI_SSID: StaticString = "YOUR_WIFI_SSID"
+let WIFI_PASS: StaticString = "YOUR_WIFI_PASSWORD"
+let MDNS_HOST: StaticString = "esp32-firmata"
+let BLE_NAME:  StaticString = "Firmata-ESP32"
+let TCP_PORT: Int32 = 3030
+
+// StaticString is a null-terminated literal; pass its bytes as a C string.
+@inline(__always) func cs(_ s: StaticString) -> UnsafePointer<UInt8> { s.utf8Start }
+
+var wifiReady = false
+
+// ===========================================================================
+//  Transport — Wi-Fi / Bonjour (orchestration in Swift; vendor calls bridged)
+// ===========================================================================
+func startBonjour() {
+  if fm_mdns_begin(cs(MDNS_HOST)) != 0 {
+    fm_mdns_add_service(cs("firmata"), cs("tcp"), TCP_PORT)
+    var ip = [UInt8](repeating: 0, count: 24)
+    ip.withUnsafeMutableBufferPointer { _ = fm_wifi_localip($0.baseAddress, 24) }
+    ip.withUnsafeBufferPointer { fm_mdns_add_txt(cs("firmata"), cs("tcp"), cs("ip"), $0.baseAddress) }
+    fm_mdns_add_txt(cs("firmata"), cs("tcp"), cs("port"), cs("3030"))
+    fm_log(cs("Bonjour: _firmata._tcp on :3030"))
+  } else {
+    fm_log(cs("mDNS start failed"))
+  }
+}
+
+func startTcpServices() {
+  startBonjour()
+  fm_tcp_begin(TCP_PORT)
+  wifiReady = true
+  fm_log(cs("Wi-Fi up. IP ="))
+  var ip = [UInt8](repeating: 0, count: 24)
+  ip.withUnsafeMutableBufferPointer { _ = fm_wifi_localip($0.baseAddress, 24) }
+  ip.withUnsafeBufferPointer { fm_log($0.baseAddress) }
+}
+
+func wifiStart() {
+  fm_wifi_begin(cs(WIFI_SSID), cs(WIFI_PASS), cs(MDNS_HOST))
+  fm_log(cs("Connecting to Wi-Fi..."))
+  var tries = 0
+  while fm_wifi_connected() == 0 && tries < 40 { fm_delay_ms(400); tries += 1 }
+  if fm_wifi_connected() != 0 { startTcpServices() }
+  else { fm_log(cs("Wi-Fi not up yet; BLE still available.")) }
+}
+
+func tcpPoll() {
+  if fm_wifi_connected() == 0 {
+    if wifiReady { wifiReady = false; fm_log(cs("Wi-Fi lost")) }
+    return
+  }
+  if !wifiReady { startTcpServices() }
+  if fm_tcp_poll_new() != 0 {                       // a new client is waiting
+    if fm_tcp_connected() != 0 {                    // within-TCP replace: notify the old one
+      let nb = buildEvictionFrame()
+      nb.withUnsafeBufferPointer { fm_tcp_write($0.baseAddress, Int32(nb.count)) }
+    }
+    fm_tcp_promote()
+    fm_log(cs("TCP client connected"))
+    claimMaster(TR_TCP)
+  }
+  if fm_tcp_connected() == 0 && activeTransport == TR_TCP { activeTransport = TR_NONE }
+  var g = 0
+  while fm_tcp_connected() != 0 && fm_tcp_available() != 0 && g < 1024 {
+    processByte(&liveParser, UInt8(fm_tcp_read() & 0xFF)); g += 1
+  }
+}
+
+// ===========================================================================
+//  Transport — BLE (orchestration in Swift; vendor events bridged via FIFO/flags)
+// ===========================================================================
+func bleSend(_ buf: [UInt8], _ len: Int) {
+  let mtu = Int(fm_ble_mtu())
+  let chunk = mtu > 23 ? mtu - 3 : 20
+  buf.withUnsafeBufferPointer { bp in
+    guard let base = bp.baseAddress else { return }
+    var off = 0
+    while off < len {
+      let n = (len - off < chunk) ? (len - off) : chunk
+      fm_ble_notify(base + off, Int32(n))
+      off += n
+      if off < len { fm_delay_ms(6) }
+    }
+  }
+}
+
+func blePoll() {
+  if fm_ble_poll_connect() != 0 {
+    fm_log(cs("BLE central connected")); claimMaster(TR_BLE)
+  } else if fm_ble_poll_disconnect() != 0 {
+    if activeTransport == TR_BLE { activeTransport = TR_NONE }
+    fm_log(cs("BLE central disconnected"))
+  }
+  var g = 0
+  var b = fm_ble_rx_pop()
+  while b >= 0 && g < 4096 { processByte(&liveParser, UInt8(b & 0xFF)); g += 1; b = fm_ble_rx_pop() }
+}
+
+// ===========================================================================
+//  Entry point — ESP-IDF app_main (C) calls sw_main(); Swift owns the run loop.
+// ===========================================================================
+@_cdecl("sw_main")
+public func sw_main() {
+  fm_serial_begin(115200)
+  fm_delay_ms(200)
+  fm_log(cs("=== ESP32 Firmata (Embedded Swift) : FirmataESP32 ==="))
+  fm_analog_setup()
+  systemResetState()
+  wifiStart()
+  fm_ble_begin(cs(BLE_NAME))
+  fm_log(cs("BLE advertising (Nordic UART Service)"))
+  while true {
+    tcpPoll()
+    blePoll()
+    loopTick()
+    fm_delay_ms(1)
   }
 }
