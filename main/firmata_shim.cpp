@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 #include "Arduino.h"
 #include "WiFi.h"
+#include "HTTPClient.h"
 #include "ESPmDNS.h"
 #include "Wire.h"
 #include "BLEDevice.h"
@@ -78,9 +79,48 @@ void fm_mdns_add_txt(const uint8_t *svc, const uint8_t *proto, const uint8_t *k,
 }
 
 // ===========================================================================
-//  TCP server / client  (one vendor op each; Swift drives accept/read/write)
+//  HTTP client  (Arduino HTTPClient over Wi-Fi; Swift sequences the call and
+//  decides what to do with the result). Response body is held here until the
+//  next request; Swift copies it out via fm_http_resp_len / fm_http_resp_copy.
 // ===========================================================================
 } // extern "C"
+static String httpBody;
+extern "C" {
+// method: 0=GET, 1=POST. url/body/content_type are null-terminated.
+// Returns the HTTP status code, or <=0 on error (0 = Wi-Fi down / bad URL).
+int fm_http_request(const uint8_t *url, int is_post,
+                    const uint8_t *body, const uint8_t *content_type) {
+  httpBody = "";
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
+  http.setReuse(false);
+  WiFiClient plain;                          // plain HTTP only (see note below)
+  if (!http.begin(plain, (const char *)url)) return 0;
+  int code;
+  if (is_post) {
+    if (content_type && content_type[0]) http.addHeader("Content-Type", (const char *)content_type);
+    code = http.POST((uint8_t *)body, body ? strlen((const char *)body) : 0);
+  } else {
+    code = http.GET();
+  }
+  if (code > 0) httpBody = http.getString();
+  http.end();
+  return code;
+}
+int fm_http_resp_len(void) { return (int)httpBody.length(); }
+int fm_http_resp_copy(uint8_t *dst, int max) {
+  int n = (int)httpBody.length();
+  if (n > max) n = max;
+  memcpy(dst, httpBody.c_str(), (size_t)n);
+  return n;
+}
+} // extern "C"
+
+// ===========================================================================
+//  TCP server / client  (one vendor op each; Swift drives accept/read/write)
+// ===========================================================================
 static WiFiServer *tcpServer = nullptr;
 static WiFiClient  tcpClient;
 static WiFiClient  tcpIncoming;

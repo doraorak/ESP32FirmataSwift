@@ -17,7 +17,7 @@
 // ===========================================================================
 //  Firmware identity (firmware-report message)
 // ===========================================================================
-let FIRMWARE_NAME: StaticString = "FirmataESP32"
+let FIRMWARE_NAME: StaticString = "swiftFirmataESP32"
 let FIRMWARE_MAJOR: UInt8 = 2
 let FIRMWARE_MINOR: UInt8 = 8
 let PROTOCOL_MAJOR: UInt8 = 2
@@ -64,6 +64,7 @@ let SCHED_RESET: UInt8           = 0x07
 let SCHED_ERROR_REPLY: UInt8     = 0x08
 let SCHED_QUERY_ALL_REPLY: UInt8 = 0x09
 let SCHED_QUERY_REPLY: UInt8     = 0x0A
+let SCHED_EXT_HTTP_REPLY: UInt8  = 0x0B   // device -> host: status + response body
 
 // Logic extension (NONSTANDARD.md) under EXTENDED_SCHEDULER_COMMAND (0x7F)
 let SCHED_EXT_COMMAND: UInt8      = 0x7F
@@ -72,6 +73,7 @@ let SCHED_EXT_READ_DIGITAL: UInt8 = 0x11
 let SCHED_EXT_READ_ANALOG: UInt8  = 0x12
 let SCHED_EXT_IF: UInt8           = 0x13
 let SCHED_EXT_SKIP: UInt8         = 0x14
+let SCHED_EXT_HTTP: UInt8         = 0x15   // make an internet request from a task
 
 // Pin modes
 let PIN_MODE_INPUT: UInt8  = 0x00
@@ -108,7 +110,7 @@ func pinOfAnalogChannel(_ ch: Int) -> Int { (ch >= 0 && ch < NUM_ANALOG) ? ANALO
 // ===========================================================================
 //  Parser + scheduler types
 // ===========================================================================
-let SYSEX_MAX = 256
+let SYSEX_MAX = 512   // large enough for an HTTP op's URL + body in one SysEx
 
 struct ParserState {
   var parsingSysex = false
@@ -152,20 +154,18 @@ struct ContinuousRead { var address: UInt16 = 0; var reg: Int = -1; var count: U
 let MAX_CONT_READS = 8
 var contReads = [ContinuousRead](repeating: ContinuousRead(), count: MAX_CONT_READS)
 
-// Parser + scheduler instances
-var liveParser = ParserState()
-var taskParser = ParserState()
-var schedTasks: [SchedTask] = {
-  var a: [SchedTask] = []
-  for _ in 0..<MAX_TASKS { a.append(SchedTask()) }
-  return a
-}()
-var runningTask: SchedTask? = nil
 let NUM_SCHED_REGS = 16
-var schedReg = [Int32](repeating: 0, count: NUM_SCHED_REGS)
 
-// Scratch buffer used to build outgoing frames.
-var frameBuf = [UInt8](repeating: 0, count: 1024)
+// Live protocol handler, scheduler, and the dedicated handler for task replay.
+// Their cross-references are wired once at startup in sw_main().
+let scheduler     = Scheduler()
+let liveHandler   = FirmataProtocol()
+let replayHandler = FirmataProtocol()
+
+// Scratch buffer used to build outgoing frames (sized for HTTP response bodies).
+var frameBuf = [UInt8](repeating: 0, count: 2048)
+// Max HTTP response body bytes echoed back to a connected host.
+let HTTP_REPLY_MAX = 768
 
 // Dual-transport master arbitration (latest-wins). Wi-Fi-only build -> TCP/none.
 let TR_NONE: UInt8 = 0
@@ -286,97 +286,9 @@ func sendI2CReply(_ address: UInt16, _ reg: Int, _ data: [UInt8], _ count: Int) 
 // ===========================================================================
 //  Pin I/O handlers
 // ===========================================================================
-func handleSetPinMode(_ pin: Int, _ mode: UInt8) {
-  if pin >= TOTAL_PINS { return }
-  switch mode {
-  case PIN_MODE_INPUT:
-    if isUsable(pin) { fm_pin_mode(Int32(pin), 0); pinModes[pin] = mode; pinConfigured[pin] = true }
-  case PIN_MODE_PULLUP:
-    if isFullDigital(pin) { fm_pin_mode(Int32(pin), 2); pinModes[pin] = mode; pinValues[pin] = 1; pinConfigured[pin] = true }
-  case PIN_MODE_OUTPUT:
-    if isFullDigital(pin) { fm_pin_mode(Int32(pin), 1); pinModes[pin] = mode; pinConfigured[pin] = true }
-  case PIN_MODE_ANALOG:
-    if analogChannelOfPin(pin) >= 0 { pinModes[pin] = mode }
-  case PIN_MODE_PWM:
-    if isFullDigital(pin) { pinModes[pin] = mode; pwm(pin, 0); pinValues[pin] = 0 }
-  case PIN_MODE_I2C:
-    pinModes[pin] = mode
-  default:
-    break
-  }
-}
-
-func handleSetDigitalPinValue(_ pin: Int, _ value: UInt8) {
-  if pin >= TOTAL_PINS { return }
-  if pinModes[pin] == PIN_MODE_OUTPUT {
-    digitalWrite(UInt8(pin), value != 0 ? 1 : 0)
-    pinValues[pin] = value != 0 ? 1 : 0
-  }
-}
-
-func handleDigitalMessage(_ port: Int, _ lsb: UInt8, _ msb: UInt8) {
-  let portValue = Int(lsb & 0x7F) | (Int(msb & 0x01) << 7)
-  for i in 0..<8 {
-    let pin = port * 8 + i
-    if pin >= TOTAL_PINS { break }
-    if pinModes[pin] == PIN_MODE_OUTPUT {
-      let bit = (portValue >> i) & 0x01
-      digitalWrite(UInt8(pin), UInt8(bit))
-      pinValues[pin] = bit
-    }
-  }
-}
-
-func handleAnalogMessage(_ pin: Int, _ lsb: UInt8, _ msb: UInt8) {
-  if pin >= TOTAL_PINS { return }
-  let value = Int(lsb & 0x7F) | (Int(msb & 0x7F) << 7)
-  if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
-}
-
-func handleReportAnalog(_ channel: Int, _ enable: UInt8) {
-  if channel > 15 { return }
-  if enable != 0 { analogReportMask |= (UInt16(1) << channel) }
-  else           { analogReportMask &= ~(UInt16(1) << channel) }
-}
-
-func handleReportDigital(_ port: Int, _ enable: UInt8) {
-  if port >= NUM_PORTS { return }
-  reportPort[port] = (enable != 0)
-  if reportPort[port] {
-    var mask: UInt8 = 0
-    for i in 0..<8 {
-      let pin = port * 8 + i
-      if pin >= TOTAL_PINS { break }
-      if !isUsable(pin) || !pinConfigured[pin] { continue }
-      let m = pinModes[pin]
-      if m == PIN_MODE_INPUT || m == PIN_MODE_PULLUP {
-        if digitalRead(UInt8(pin)) != 0 { mask |= (UInt8(1) << i) }
-      } else if m == PIN_MODE_OUTPUT {
-        if pinValues[pin] != 0 { mask |= (UInt8(1) << i) }
-      }
-    }
-    previousPort[port] = mask
-    sendDigitalPort(port, mask)
-  }
-}
-
-func handleExtendedAnalog(_ data: [UInt8], _ len: Int) {
-  if len < 1 { return }
-  let pin = Int(data[0])
-  if pin >= TOTAL_PINS { return }
-  var value = 0
-  for i in 1..<len { value |= Int(data[i] & 0x7F) << (7 * (i - 1)) }
-  if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
-}
-
 // ===========================================================================
-//  I2C
+//  I2C device helpers (shared by the live handler and periodic sampling)
 // ===========================================================================
-func handleI2CConfig(_ data: [UInt8], _ len: Int) {
-  fm_i2c_begin(Int32(I2C_SDA_PIN), Int32(I2C_SCL_PIN))
-  if len >= 2 { i2cReadDelayUs = UInt16(data[0] & 0x7F) | (UInt16(data[1] & 0x7F) << 7) }
-}
-
 func i2cDoRead(_ address: UInt16, _ reg: Int, _ count0: UInt16) {
   if reg >= 0 {
     fm_i2c_begin_transmission(Int32(address))
@@ -405,164 +317,255 @@ func stopContinuousRead(_ address: UInt16) {
   for i in 0..<MAX_CONT_READS where contReads[i].active && contReads[i].address == address { contReads[i].active = false }
 }
 
-func handleI2CRequest(_ data: [UInt8], _ len: Int) {
-  if len < 2 { return }
-  var address = UInt16(data[0] & 0x7F)
-  let control = data[1]
-  let mode = (control >> 3) & 0x03
-  let tenbit = (control & 0x20) != 0
-  if tenbit { address |= UInt16(control & 0x07) << 7 }
-
-  let poff = 2
-  let plen = len - 2
-
-  switch mode {
-  case 0:  // WRITE
-    fm_i2c_begin_transmission(Int32(address))
-    var i = 0
-    while i + 1 < plen {
-      let b = (data[poff + i] & 0x7F) | ((data[poff + i + 1] & 0x7F) << 7)
-      fm_i2c_write(Int32(b)); i += 2
-    }
-    let restart = (control & 0x40) != 0
-    _ = fm_i2c_end_transmission(restart ? 0 : 1)   // restart -> no STOP
-  case 1:  // READ_ONCE
-    var reg = -1; var count: UInt16 = 0
-    if plen >= 4 {
-      reg   = Int(data[poff] & 0x7F) | (Int(data[poff + 1] & 0x7F) << 7)
-      count = UInt16(data[poff + 2] & 0x7F) | (UInt16(data[poff + 3] & 0x7F) << 7)
-    } else if plen >= 2 {
-      count = UInt16(data[poff] & 0x7F) | (UInt16(data[poff + 1] & 0x7F) << 7)
-    }
-    i2cDoRead(address, reg, count)
-  case 2:  // READ_CONTINUOUS
-    var reg = -1; var count: UInt16 = 0
-    if plen >= 4 {
-      reg   = Int(data[poff] & 0x7F) | (Int(data[poff + 1] & 0x7F) << 7)
-      count = UInt16(data[poff + 2] & 0x7F) | (UInt16(data[poff + 3] & 0x7F) << 7)
-    } else if plen >= 2 {
-      count = UInt16(data[poff] & 0x7F) | (UInt16(data[poff + 1] & 0x7F) << 7)
-    }
-    addContinuousRead(address, reg, count)
-  case 3:  // STOP_READING
-    stopContinuousRead(address)
-  default:
-    break
-  }
-}
-
 // ===========================================================================
-//  SysEx dispatch
+//  Live protocol handler
+//
+//  Parses an incoming Firmata byte stream (its own ParserState) and applies
+//  each command. One instance drives the live transport; a second instance
+//  drives scheduler task replay. Both act on shared device state and route
+//  scheduler SysEx to the shared `Scheduler`.
 // ===========================================================================
-func handleString(_ data: [UInt8], _ len: Int) {
-  var s = [UInt8](repeating: 0, count: len / 2 + 1)
-  var j = 0, i = 0
-  while i + 1 < len {
-    let cp = Int(data[i] & 0x7F) | (Int(data[i + 1] & 0x7F) << 7)
-    if cp < 128 { s[j] = UInt8(cp); j += 1 }
-    i += 2
-  }
-  s[j] = 0
-  s.withUnsafeBufferPointer { fm_log($0.baseAddress) }
-}
+final class FirmataProtocol {
+  var ps = ParserState()
+  var sched: Scheduler!            // wired once at startup (see sw_main)
 
-func processSysex(_ buf: [UInt8], _ len: Int) {
-  if len < 1 { return }
-  let cmd = buf[0]
-  let data = Array(buf[1..<len])   // mirrors `data = buf + 1`
-  let dlen = len - 1
-
-  switch cmd {
-  case REPORT_FIRMWARE:      sendFirmwareReport()
-  case CAPABILITY_QUERY:     sendCapabilityResponse()
-  case ANALOG_MAPPING_QUERY: sendAnalogMappingResponse()
-  case PIN_STATE_QUERY:      if dlen >= 1 { sendPinStateResponse(Int(data[0])) }
-  case EXTENDED_ANALOG:      handleExtendedAnalog(data, dlen)
-  case SAMPLING_INTERVAL:
-    if dlen >= 2 {
-      samplingInterval = UInt16(data[0] & 0x7F) | (UInt16(data[1] & 0x7F) << 7)
-      if samplingInterval < MIN_SAMPLING { samplingInterval = MIN_SAMPLING }
+  func handleSetPinMode(_ pin: Int, _ mode: UInt8) {
+    if pin >= TOTAL_PINS { return }
+    switch mode {
+    case PIN_MODE_INPUT:
+      if isUsable(pin) { fm_pin_mode(Int32(pin), 0); pinModes[pin] = mode; pinConfigured[pin] = true }
+    case PIN_MODE_PULLUP:
+      if isFullDigital(pin) { fm_pin_mode(Int32(pin), 2); pinModes[pin] = mode; pinValues[pin] = 1; pinConfigured[pin] = true }
+    case PIN_MODE_OUTPUT:
+      if isFullDigital(pin) { fm_pin_mode(Int32(pin), 1); pinModes[pin] = mode; pinConfigured[pin] = true }
+    case PIN_MODE_ANALOG:
+      if analogChannelOfPin(pin) >= 0 { pinModes[pin] = mode }
+    case PIN_MODE_PWM:
+      if isFullDigital(pin) { pinModes[pin] = mode; pwm(pin, 0); pinValues[pin] = 0 }
+    case PIN_MODE_I2C:
+      pinModes[pin] = mode
+    default:
+      break
     }
-  case STRING_DATA:          handleString(data, dlen)
-  case I2C_CONFIG:           handleI2CConfig(data, dlen)
-  case I2C_REQUEST:          handleI2CRequest(data, dlen)
-  case SCHEDULER_DATA:       schedHandleSysex(data, dlen)
-  default:                   break
-  }
-}
-
-// ===========================================================================
-//  Input byte processor (Firmata state machine)
-// ===========================================================================
-func processByte(_ ps: inout ParserState, _ inputData: UInt8) {
-  if ps.parsingSysex {
-    if inputData == END_SYSEX {
-      ps.parsingSysex = false
-      processSysex(ps.sysexBuffer, ps.sysexBytesRead)
-    } else if ps.sysexBytesRead < SYSEX_MAX {
-      ps.sysexBuffer[ps.sysexBytesRead] = inputData; ps.sysexBytesRead += 1
-    }
-    return
   }
 
-  if ps.waitForData > 0 && inputData < 0x80 {
-    ps.waitForData -= 1
-    ps.storedInputData[ps.waitForData] = inputData
-    if ps.waitForData == 0 && ps.executeMultiByteCommand != 0 {
-      switch ps.executeMultiByteCommand {
-      case ANALOG_MESSAGE:
-        handleAnalogMessage(Int(ps.multiByteChannel), ps.storedInputData[1], ps.storedInputData[0])
-      case DIGITAL_MESSAGE:
-        handleDigitalMessage(Int(ps.multiByteChannel), ps.storedInputData[1], ps.storedInputData[0])
-      case SET_PIN_MODE:
-        handleSetPinMode(Int(ps.storedInputData[1]), ps.storedInputData[0])
-      case SET_DIGITAL_PIN_VALUE:
-        handleSetDigitalPinValue(Int(ps.storedInputData[1]), ps.storedInputData[0])
-      case REPORT_ANALOG:
-        handleReportAnalog(Int(ps.multiByteChannel), ps.storedInputData[0])
-      case REPORT_DIGITAL:
-        handleReportDigital(Int(ps.multiByteChannel), ps.storedInputData[0])
-      default: break
+  func handleSetDigitalPinValue(_ pin: Int, _ value: UInt8) {
+    if pin >= TOTAL_PINS { return }
+    if pinModes[pin] == PIN_MODE_OUTPUT {
+      digitalWrite(UInt8(pin), value != 0 ? 1 : 0)
+      pinValues[pin] = value != 0 ? 1 : 0
+    }
+  }
+
+  func handleDigitalMessage(_ port: Int, _ lsb: UInt8, _ msb: UInt8) {
+    let portValue = Int(lsb & 0x7F) | (Int(msb & 0x01) << 7)
+    for i in 0..<8 {
+      let pin = port * 8 + i
+      if pin >= TOTAL_PINS { break }
+      if pinModes[pin] == PIN_MODE_OUTPUT {
+        let bit = (portValue >> i) & 0x01
+        digitalWrite(UInt8(pin), UInt8(bit))
+        pinValues[pin] = bit
       }
-      ps.executeMultiByteCommand = 0
     }
-    return
   }
 
-  // New command byte.
-  var command: UInt8
-  if inputData < 0xF0 {
-    command = inputData & 0xF0
-    ps.multiByteChannel = inputData & 0x0F
-  } else {
-    command = inputData
+  func handleAnalogMessage(_ pin: Int, _ lsb: UInt8, _ msb: UInt8) {
+    if pin >= TOTAL_PINS { return }
+    let value = Int(lsb & 0x7F) | (Int(msb & 0x7F) << 7)
+    if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
   }
 
-  switch command {
-  case ANALOG_MESSAGE, DIGITAL_MESSAGE, SET_PIN_MODE, SET_DIGITAL_PIN_VALUE:
-    ps.waitForData = 2; ps.executeMultiByteCommand = command
-  case REPORT_ANALOG, REPORT_DIGITAL:
-    ps.waitForData = 1; ps.executeMultiByteCommand = command
-  case START_SYSEX:
-    ps.parsingSysex = true; ps.sysexBytesRead = 0
-  case SYSTEM_RESET:
-    systemResetState()
-  case REPORT_VERSION:
-    sendProtocolVersion()
-  default:
-    break
+  func handleReportAnalog(_ channel: Int, _ enable: UInt8) {
+    if channel > 15 { return }
+    if enable != 0 { analogReportMask |= (UInt16(1) << channel) }
+    else           { analogReportMask &= ~(UInt16(1) << channel) }
+  }
+
+  func handleReportDigital(_ port: Int, _ enable: UInt8) {
+    if port >= NUM_PORTS { return }
+    reportPort[port] = (enable != 0)
+    if reportPort[port] {
+      var mask: UInt8 = 0
+      for i in 0..<8 {
+        let pin = port * 8 + i
+        if pin >= TOTAL_PINS { break }
+        if !isUsable(pin) || !pinConfigured[pin] { continue }
+        let m = pinModes[pin]
+        if m == PIN_MODE_INPUT || m == PIN_MODE_PULLUP {
+          if digitalRead(UInt8(pin)) != 0 { mask |= (UInt8(1) << i) }
+        } else if m == PIN_MODE_OUTPUT {
+          if pinValues[pin] != 0 { mask |= (UInt8(1) << i) }
+        }
+      }
+      previousPort[port] = mask
+      sendDigitalPort(port, mask)
+    }
+  }
+
+  func handleExtendedAnalog(_ data: [UInt8], _ len: Int) {
+    if len < 1 { return }
+    let pin = Int(data[0])
+    if pin >= TOTAL_PINS { return }
+    var value = 0
+    for i in 1..<len { value |= Int(data[i] & 0x7F) << (7 * (i - 1)) }
+    if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
+  }
+
+  func handleI2CConfig(_ data: [UInt8], _ len: Int) {
+    fm_i2c_begin(Int32(I2C_SDA_PIN), Int32(I2C_SCL_PIN))
+    if len >= 2 { i2cReadDelayUs = UInt16(data[0] & 0x7F) | (UInt16(data[1] & 0x7F) << 7) }
+  }
+
+  func handleI2CRequest(_ data: [UInt8], _ len: Int) {
+    if len < 2 { return }
+    var address = UInt16(data[0] & 0x7F)
+    let control = data[1]
+    let mode = (control >> 3) & 0x03
+    let tenbit = (control & 0x20) != 0
+    if tenbit { address |= UInt16(control & 0x07) << 7 }
+
+    let poff = 2
+    let plen = len - 2
+
+    switch mode {
+    case 0:  // WRITE
+      fm_i2c_begin_transmission(Int32(address))
+      var i = 0
+      while i + 1 < plen {
+        let b = (data[poff + i] & 0x7F) | ((data[poff + i + 1] & 0x7F) << 7)
+        fm_i2c_write(Int32(b)); i += 2
+      }
+      let restart = (control & 0x40) != 0
+      _ = fm_i2c_end_transmission(restart ? 0 : 1)   // restart -> no STOP
+    case 1:  // READ_ONCE
+      var reg = -1; var count: UInt16 = 0
+      if plen >= 4 {
+        reg   = Int(data[poff] & 0x7F) | (Int(data[poff + 1] & 0x7F) << 7)
+        count = UInt16(data[poff + 2] & 0x7F) | (UInt16(data[poff + 3] & 0x7F) << 7)
+      } else if plen >= 2 {
+        count = UInt16(data[poff] & 0x7F) | (UInt16(data[poff + 1] & 0x7F) << 7)
+      }
+      i2cDoRead(address, reg, count)
+    case 2:  // READ_CONTINUOUS
+      var reg = -1; var count: UInt16 = 0
+      if plen >= 4 {
+        reg   = Int(data[poff] & 0x7F) | (Int(data[poff + 1] & 0x7F) << 7)
+        count = UInt16(data[poff + 2] & 0x7F) | (UInt16(data[poff + 3] & 0x7F) << 7)
+      } else if plen >= 2 {
+        count = UInt16(data[poff] & 0x7F) | (UInt16(data[poff + 1] & 0x7F) << 7)
+      }
+      addContinuousRead(address, reg, count)
+    case 3:  // STOP_READING
+      stopContinuousRead(address)
+    default:
+      break
+    }
+  }
+
+  func handleString(_ data: [UInt8], _ len: Int) {
+    var s = [UInt8](repeating: 0, count: len / 2 + 1)
+    var j = 0, i = 0
+    while i + 1 < len {
+      let cp = Int(data[i] & 0x7F) | (Int(data[i + 1] & 0x7F) << 7)
+      if cp < 128 { s[j] = UInt8(cp); j += 1 }
+      i += 2
+    }
+    s[j] = 0
+    s.withUnsafeBufferPointer { fm_log($0.baseAddress) }
+  }
+
+  func processSysex(_ buf: [UInt8], _ len: Int) {
+    if len < 1 { return }
+    let cmd = buf[0]
+    let data = Array(buf[1..<len])   // mirrors `data = buf + 1`
+    let dlen = len - 1
+
+    switch cmd {
+    case REPORT_FIRMWARE:      sendFirmwareReport()
+    case CAPABILITY_QUERY:     sendCapabilityResponse()
+    case ANALOG_MAPPING_QUERY: sendAnalogMappingResponse()
+    case PIN_STATE_QUERY:      if dlen >= 1 { sendPinStateResponse(Int(data[0])) }
+    case EXTENDED_ANALOG:      handleExtendedAnalog(data, dlen)
+    case SAMPLING_INTERVAL:
+      if dlen >= 2 {
+        samplingInterval = UInt16(data[0] & 0x7F) | (UInt16(data[1] & 0x7F) << 7)
+        if samplingInterval < MIN_SAMPLING { samplingInterval = MIN_SAMPLING }
+      }
+    case STRING_DATA:          handleString(data, dlen)
+    case I2C_CONFIG:           handleI2CConfig(data, dlen)
+    case I2C_REQUEST:          handleI2CRequest(data, dlen)
+    case SCHEDULER_DATA:       sched.handleSysex(data, dlen)
+    default:                   break
+    }
+  }
+
+  // Firmata input byte state machine; mutates this handler's own ParserState.
+  func process(_ inputData: UInt8) {
+    if ps.parsingSysex {
+      if inputData == END_SYSEX {
+        ps.parsingSysex = false
+        processSysex(ps.sysexBuffer, ps.sysexBytesRead)
+      } else if ps.sysexBytesRead < SYSEX_MAX {
+        ps.sysexBuffer[ps.sysexBytesRead] = inputData; ps.sysexBytesRead += 1
+      }
+      return
+    }
+
+    if ps.waitForData > 0 && inputData < 0x80 {
+      ps.waitForData -= 1
+      ps.storedInputData[ps.waitForData] = inputData
+      if ps.waitForData == 0 && ps.executeMultiByteCommand != 0 {
+        switch ps.executeMultiByteCommand {
+        case ANALOG_MESSAGE:
+          handleAnalogMessage(Int(ps.multiByteChannel), ps.storedInputData[1], ps.storedInputData[0])
+        case DIGITAL_MESSAGE:
+          handleDigitalMessage(Int(ps.multiByteChannel), ps.storedInputData[1], ps.storedInputData[0])
+        case SET_PIN_MODE:
+          handleSetPinMode(Int(ps.storedInputData[1]), ps.storedInputData[0])
+        case SET_DIGITAL_PIN_VALUE:
+          handleSetDigitalPinValue(Int(ps.storedInputData[1]), ps.storedInputData[0])
+        case REPORT_ANALOG:
+          handleReportAnalog(Int(ps.multiByteChannel), ps.storedInputData[0])
+        case REPORT_DIGITAL:
+          handleReportDigital(Int(ps.multiByteChannel), ps.storedInputData[0])
+        default: break
+        }
+        ps.executeMultiByteCommand = 0
+      }
+      return
+    }
+
+    // New command byte.
+    var command: UInt8
+    if inputData < 0xF0 {
+      command = inputData & 0xF0
+      ps.multiByteChannel = inputData & 0x0F
+    } else {
+      command = inputData
+    }
+
+    switch command {
+    case ANALOG_MESSAGE, DIGITAL_MESSAGE, SET_PIN_MODE, SET_DIGITAL_PIN_VALUE:
+      ps.waitForData = 2; ps.executeMultiByteCommand = command
+    case REPORT_ANALOG, REPORT_DIGITAL:
+      ps.waitForData = 1; ps.executeMultiByteCommand = command
+    case START_SYSEX:
+      ps.parsingSysex = true; ps.sysexBytesRead = 0
+    case SYSTEM_RESET:
+      systemResetState()
+    case REPORT_VERSION:
+      sendProtocolVersion()
+    default:
+      break
+    }
   }
 }
 
 // ===========================================================================
-//  Firmata Scheduler (SysEx 0x7B)
+//  Encoder7Bit helpers (8-bit data packed into 7-bit bytes), shared by the
+//  Scheduler and used against the shared `frameBuf`.
 // ===========================================================================
-func schedFind(_ id: UInt8) -> SchedTask? {
-  for i in 0..<MAX_TASKS where schedTasks[i].used && schedTasks[i].id == id { return schedTasks[i] }
-  return nil
-}
-
-// Encoder7Bit decode: unpack `outBytes` 8-bit bytes from 7-bit `inp`.
 func sched7BitDecode(_ outBytes: Int, _ inp: [UInt8], _ out: inout [UInt8]) {
   let inLen = inp.count
   for i in 0..<outBytes {
@@ -583,59 +586,6 @@ func sched7BitTime(_ enc5: [UInt8]) -> UInt32 {
   return UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24)
 }
 
-func schedReset() {
-  for i in 0..<MAX_TASKS { schedTasks[i].used = false }
-  for i in 0..<NUM_SCHED_REGS { schedReg[i] = 0 }
-  runningTask = nil
-}
-
-func schedSendError(_ id: UInt8) {
-  sendFrame([START_SYSEX, SCHEDULER_DATA, SCHED_ERROR_REPLY, id, END_SYSEX], 5)
-}
-
-func schedCreate(_ id: UInt8, _ len: UInt16) {
-  if schedFind(id) != nil || len > UInt16(MAX_TASK_BYTES) { schedSendError(id); return }
-  for i in 0..<MAX_TASKS where !schedTasks[i].used {
-    let t = schedTasks[i]
-    t.used = true; t.id = id; t.time_ms = 0; t.len = len; t.pos = 0
-    return
-  }
-  schedSendError(id)  // no free slot
-}
-
-func schedDelete(_ id: UInt8) {
-  if let t = schedFind(id) { if runningTask === t { runningTask = nil }; t.used = false }
-}
-
-func schedAdd(_ id: UInt8, _ data: [UInt8], _ n: Int) {
-  guard let t = schedFind(id) else { schedSendError(id); return }
-  if Int(t.pos) + n > Int(t.len) { return }      // would overflow reserved length
-  for i in 0..<n { t.data[Int(t.pos)] = data[i]; t.pos += 1 }
-}
-
-func schedSchedule(_ id: UInt8, _ delayMs: UInt32) {
-  guard let t = schedFind(id) else { schedSendError(id); return }
-  t.pos = 0
-  t.time_ms = fm_millis() &+ delayMs
-  if t.time_ms == 0 { t.time_ms = 1 }
-}
-
-func schedDelayRunning(_ delayMs: UInt32) {
-  guard let t = runningTask else { return }
-  let now = fm_millis()
-  t.time_ms = t.time_ms &+ delayMs
-  if Int32(bitPattern: t.time_ms &- now) < 0 { t.time_ms = now }
-  if t.time_ms == 0 { t.time_ms = 1 }
-}
-
-func schedQueryAll() {
-  var n = 0
-  frameBuf[n] = START_SYSEX; n += 1; frameBuf[n] = SCHEDULER_DATA; n += 1; frameBuf[n] = SCHED_QUERY_ALL_REPLY; n += 1
-  for i in 0..<MAX_TASKS where schedTasks[i].used { frameBuf[n] = schedTasks[i].id; n += 1 }
-  frameBuf[n] = END_SYSEX; n += 1
-  sendFrame(frameBuf, n)
-}
-
 // Encoder7Bit encode one byte into frameBuf, carrying state in shift/prev.
 func sched7BitPut(_ n: inout Int, _ shift: inout UInt8, _ prev: inout UInt8, _ d: UInt8) {
   if shift == 0 {
@@ -647,135 +597,299 @@ func sched7BitPut(_ n: inout Int, _ shift: inout UInt8, _ prev: inout UInt8, _ d
   }
 }
 
-func schedQueryTask(_ id: UInt8) {
-  guard let t = schedFind(id) else { schedSendError(id); return }
-  var n = 0
-  frameBuf[n] = START_SYSEX; n += 1; frameBuf[n] = SCHEDULER_DATA; n += 1; frameBuf[n] = SCHED_QUERY_REPLY; n += 1
-  frameBuf[n] = id; n += 1
-  let header: [UInt8] = [
-    UInt8(t.time_ms & 0xFF), UInt8((t.time_ms >> 8) & 0xFF),
-    UInt8((t.time_ms >> 16) & 0xFF), UInt8((t.time_ms >> 24) & 0xFF),
-    UInt8(t.len & 0xFF), UInt8((t.len >> 8) & 0xFF),
-    UInt8(t.pos & 0xFF), UInt8((t.pos >> 8) & 0xFF)
-  ]
-  var shift: UInt8 = 0, prev: UInt8 = 0
-  for i in 0..<8 { sched7BitPut(&n, &shift, &prev, header[i]) }
+// Scan a byte buffer for the first (optionally signed) base-10 integer.
+func parseFirstInt(_ buf: [UInt8], _ n: Int) -> Int32 {
   var i = 0
-  while i < Int(t.len) { sched7BitPut(&n, &shift, &prev, t.data[i]); i += 1 }
-  if shift > 0 { frameBuf[n] = prev; n += 1 }
-  frameBuf[n] = END_SYSEX; n += 1
-  sendFrame(frameBuf, n)
-}
-
-// ---- NON-STANDARD scheduler logic extension (NONSTANDARD.md) ----
-func schedCompare(_ op: UInt8, _ a: Int32, _ b: Int32) -> Bool {
-  switch op {
-  case 0: return a == b
-  case 1: return a != b
-  case 2: return a <  b
-  case 3: return a >  b
-  case 4: return a <= b
-  case 5: return a >= b
-  default: return false
+  while i < n && !(buf[i] >= 48 && buf[i] <= 57) && buf[i] != 45 { i += 1 }
+  if i >= n { return 0 }
+  var neg = false
+  if buf[i] == 45 { neg = true; i += 1 }
+  var v: Int32 = 0; var any = false
+  while i < n && buf[i] >= 48 && buf[i] <= 57 {
+    v = v &* 10 &+ Int32(buf[i] - 48); any = true   // wrapping: avoids 64-bit overflow builtins
+    i += 1
   }
+  if !any { return 0 }
+  return neg ? (0 &- v) : v
 }
 
-func schedReadOperand(_ payload: [UInt8], _ plen: Int, _ i: inout Int) -> Int32 {
-  if i >= plen { return 0 }
-  let type = payload[i]; i += 1
-  if type == 0 {                     // register
+// ===========================================================================
+//  Firmata Scheduler (SysEx 0x7B)
+//
+//  Stores tasks (recorded Firmata bytes + delays) and replays them — through a
+//  dedicated FirmataProtocol instance (`replay`) — even with no host connected.
+//  Also owns the non-standard logic extension (16 Int32 registers, if/else and
+//  internet actions).
+// ===========================================================================
+final class Scheduler {
+  var tasks: [SchedTask] = {
+    var a: [SchedTask] = []
+    for _ in 0..<MAX_TASKS { a.append(SchedTask()) }
+    return a
+  }()
+  var running: SchedTask? = nil
+  var regs = [Int32](repeating: 0, count: NUM_SCHED_REGS)
+  var replay: FirmataProtocol!     // wired once at startup (see sw_main)
+
+  func find(_ id: UInt8) -> SchedTask? {
+    for i in 0..<MAX_TASKS where tasks[i].used && tasks[i].id == id { return tasks[i] }
+    return nil
+  }
+
+  func reset() {
+    for i in 0..<MAX_TASKS { tasks[i].used = false }
+    for i in 0..<NUM_SCHED_REGS { regs[i] = 0 }
+    running = nil
+  }
+
+  func sendError(_ id: UInt8) {
+    sendFrame([START_SYSEX, SCHEDULER_DATA, SCHED_ERROR_REPLY, id, END_SYSEX], 5)
+  }
+
+  func create(_ id: UInt8, _ len: UInt16) {
+    if find(id) != nil || len > UInt16(MAX_TASK_BYTES) { sendError(id); return }
+    for i in 0..<MAX_TASKS where !tasks[i].used {
+      let t = tasks[i]
+      t.used = true; t.id = id; t.time_ms = 0; t.len = len; t.pos = 0
+      return
+    }
+    sendError(id)  // no free slot
+  }
+
+  func delete(_ id: UInt8) {
+    if let t = find(id) { if running === t { running = nil }; t.used = false }
+  }
+
+  func add(_ id: UInt8, _ data: [UInt8], _ n: Int) {
+    guard let t = find(id) else { sendError(id); return }
+    if Int(t.pos) + n > Int(t.len) { return }      // would overflow reserved length
+    for i in 0..<n { t.data[Int(t.pos)] = data[i]; t.pos += 1 }
+  }
+
+  func schedule(_ id: UInt8, _ delayMs: UInt32) {
+    guard let t = find(id) else { sendError(id); return }
+    t.pos = 0
+    t.time_ms = fm_millis() &+ delayMs
+    if t.time_ms == 0 { t.time_ms = 1 }
+  }
+
+  func delayRunning(_ delayMs: UInt32) {
+    guard let t = running else { return }
+    let now = fm_millis()
+    t.time_ms = t.time_ms &+ delayMs
+    if Int32(bitPattern: t.time_ms &- now) < 0 { t.time_ms = now }
+    if t.time_ms == 0 { t.time_ms = 1 }
+  }
+
+  func queryAll() {
+    var n = 0
+    frameBuf[n] = START_SYSEX; n += 1; frameBuf[n] = SCHEDULER_DATA; n += 1; frameBuf[n] = SCHED_QUERY_ALL_REPLY; n += 1
+    for i in 0..<MAX_TASKS where tasks[i].used { frameBuf[n] = tasks[i].id; n += 1 }
+    frameBuf[n] = END_SYSEX; n += 1
+    sendFrame(frameBuf, n)
+  }
+
+  func queryTask(_ id: UInt8) {
+    guard let t = find(id) else { sendError(id); return }
+    var n = 0
+    frameBuf[n] = START_SYSEX; n += 1; frameBuf[n] = SCHEDULER_DATA; n += 1; frameBuf[n] = SCHED_QUERY_REPLY; n += 1
+    frameBuf[n] = id; n += 1
+    let header: [UInt8] = [
+      UInt8(t.time_ms & 0xFF), UInt8((t.time_ms >> 8) & 0xFF),
+      UInt8((t.time_ms >> 16) & 0xFF), UInt8((t.time_ms >> 24) & 0xFF),
+      UInt8(t.len & 0xFF), UInt8((t.len >> 8) & 0xFF),
+      UInt8(t.pos & 0xFF), UInt8((t.pos >> 8) & 0xFF)
+    ]
+    var shift: UInt8 = 0, prev: UInt8 = 0
+    for i in 0..<8 { sched7BitPut(&n, &shift, &prev, header[i]) }
+    var i = 0
+    while i < Int(t.len) { sched7BitPut(&n, &shift, &prev, t.data[i]); i += 1 }
+    if shift > 0 { frameBuf[n] = prev; n += 1 }
+    frameBuf[n] = END_SYSEX; n += 1
+    sendFrame(frameBuf, n)
+  }
+
+  // ---- NON-STANDARD logic extension (NONSTANDARD.md) ----
+  func compare(_ op: UInt8, _ a: Int32, _ b: Int32) -> Bool {
+    switch op {
+    case 0: return a == b
+    case 1: return a != b
+    case 2: return a <  b
+    case 3: return a >  b
+    case 4: return a <= b
+    case 5: return a >= b
+    default: return false
+    }
+  }
+
+  func readOperand(_ payload: [UInt8], _ plen: Int, _ i: inout Int) -> Int32 {
     if i >= plen { return 0 }
-    let r = schedReg[Int(payload[i] & 0x0F)]; i += 1; return r
-  } else {                           // constant (5 Encoder7Bit bytes)
-    if i + 5 > plen { i = plen; return 0 }
-    let v = Int32(bitPattern: sched7BitTime(Array(payload[i..<i+5]))); i += 5; return v
-  }
-}
-
-func schedSkip(_ skip: UInt16) {
-  guard let t = runningTask else { return }
-  let p = UInt32(t.pos) + UInt32(skip)
-  t.pos = (p > UInt32(t.len)) ? t.len : UInt16(p)
-}
-
-func schedHandleExt(_ payload: [UInt8], _ plen: Int) {
-  switch payload[0] {
-  case SCHED_EXT_SET:                 // 0x10 reg <const:5>
-    if plen == 7 { schedReg[Int(payload[1] & 0x0F)] = Int32(bitPattern: sched7BitTime(Array(payload[2..<7]))) }
-  case SCHED_EXT_READ_DIGITAL:        // 0x11 reg pin
-    if plen == 3 { schedReg[Int(payload[1] & 0x0F)] = (digitalRead(payload[2]) != 0) ? 1 : 0 }
-  case SCHED_EXT_READ_ANALOG:         // 0x12 reg channel
-    if plen == 3 {
-      let pin = pinOfAnalogChannel(Int(payload[2]))
-      schedReg[Int(payload[1] & 0x0F)] = (pin >= 0) ? Int32(analogRead(UInt8(pin))) : 0
-    }
-  case SCHED_EXT_IF:                  // 0x13 op <operandA> <operandB> skipLo skipHi
-    var i = 1
-    let op = payload[i]; i += 1
-    let a = schedReadOperand(payload, plen, &i)
-    let b = schedReadOperand(payload, plen, &i)
-    if i + 2 > plen { break }
-    let skip = UInt16(payload[i]) | (UInt16(payload[i + 1]) << 7)
-    if !schedCompare(op, a, b) { schedSkip(skip) }
-  case SCHED_EXT_SKIP:                // 0x14 skipLo skipHi
-    if plen == 3 { schedSkip(UInt16(payload[1]) | (UInt16(payload[2]) << 7)) }
-  default:
-    break
-  }
-}
-
-func schedHandleSysex(_ payload: [UInt8], _ plen: Int) {
-  if plen < 1 { return }
-  switch payload[0] {
-  case SCHED_CREATE:
-    if plen == 4 { schedCreate(payload[1], UInt16(payload[2]) | (UInt16(payload[3]) << 7)) }
-  case SCHED_DELETE:
-    if plen == 2 { schedDelete(payload[1]) }
-  case SCHED_ADD:
-    if plen > 2 {
-      var outLen = sched7BitOutBytes(plen - 2)
-      if outLen > MAX_TASK_BYTES { outLen = MAX_TASK_BYTES }
-      var dec = [UInt8](repeating: 0, count: MAX_TASK_BYTES)
-      sched7BitDecode(outLen, Array(payload[2..<plen]), &dec)
-      schedAdd(payload[1], dec, outLen)
-    }
-  case SCHED_DELAY:
-    if plen == 6 { schedDelayRunning(sched7BitTime(Array(payload[1..<6]))) }
-  case SCHED_SCHEDULE:
-    if plen == 7 { schedSchedule(payload[1], sched7BitTime(Array(payload[2..<7]))) }
-  case SCHED_EXT_COMMAND:             // 0x7F: logic ops live under the reserved ext cmd
-    if plen >= 2 { schedHandleExt(Array(payload[1..<plen]), plen - 1) }
-  case SCHED_QUERY_ALL: schedQueryAll()
-  case SCHED_QUERY:     if plen == 2 { schedQueryTask(payload[1]) }
-  case SCHED_RESET:     schedReset()
-  default: break
-  }
-}
-
-// Replay a task until a delay reschedules it or it finishes. Returns true to keep it.
-func schedExecute(_ t: SchedTask) -> Bool {
-  let start = t.time_ms
-  runningTask = t
-  taskParser = ParserState()
-  while t.pos < t.len {
-    let b = t.data[Int(t.pos)]; t.pos += 1
-    processByte(&taskParser, b)
-    if t.time_ms != start {               // a DELAY_TASK fired
-      if t.pos >= t.len { t.pos = 0 }      // trailing delay -> loop from start
-      runningTask = nil
-      return true
+    let type = payload[i]; i += 1
+    if type == 0 {                     // register
+      if i >= plen { return 0 }
+      let r = regs[Int(payload[i] & 0x0F)]; i += 1; return r
+    } else {                           // constant (5 Encoder7Bit bytes)
+      if i + 5 > plen { i = plen; return 0 }
+      let v = Int32(bitPattern: sched7BitTime(Array(payload[i..<i+5]))); i += 5; return v
     }
   }
-  runningTask = nil
-  return false
-}
 
-func schedTick() {
-  let now = fm_millis()
-  for i in 0..<MAX_TASKS {
-    let t = schedTasks[i]
-    if t.used && t.time_ms != 0 && Int32(bitPattern: now &- t.time_ms) >= 0 {
-      if !schedExecute(t) { t.used = false }
+  func skip(_ amount: UInt16) {
+    guard let t = running else { return }
+    let p = UInt32(t.pos) + UInt32(amount)
+    t.pos = (p > UInt32(t.len)) ? t.len : UInt16(p)
+  }
+
+  func handleExt(_ payload: [UInt8], _ plen: Int) {
+    switch payload[0] {
+    case SCHED_EXT_SET:                 // 0x10 reg <const:5>
+      if plen == 7 { regs[Int(payload[1] & 0x0F)] = Int32(bitPattern: sched7BitTime(Array(payload[2..<7]))) }
+    case SCHED_EXT_READ_DIGITAL:        // 0x11 reg pin
+      if plen == 3 { regs[Int(payload[1] & 0x0F)] = (digitalRead(payload[2]) != 0) ? 1 : 0 }
+    case SCHED_EXT_READ_ANALOG:         // 0x12 reg channel
+      if plen == 3 {
+        let pin = pinOfAnalogChannel(Int(payload[2]))
+        regs[Int(payload[1] & 0x0F)] = (pin >= 0) ? Int32(analogRead(UInt8(pin))) : 0
+      }
+    case SCHED_EXT_IF:                  // 0x13 op <operandA> <operandB> skipLo skipHi
+      var i = 1
+      let op = payload[i]; i += 1
+      let a = readOperand(payload, plen, &i)
+      let b = readOperand(payload, plen, &i)
+      if i + 2 > plen { break }
+      let amount = UInt16(payload[i]) | (UInt16(payload[i + 1]) << 7)
+      if !compare(op, a, b) { skip(amount) }
+    case SCHED_EXT_SKIP:                // 0x14 skipLo skipHi
+      if plen == 3 { skip(UInt16(payload[1]) | (UInt16(payload[2]) << 7)) }
+    case SCHED_EXT_HTTP:               // 0x15 internet request (see NONSTANDARD.md)
+      doHttp(payload, plen)
+    default:
+      break
+    }
+  }
+
+  // ---- Internet action: a task (or a live host) can make an
+  //      HTTP(S) request over the board's Wi-Fi. Layout of the ext payload:
+  //        0x15 method statusReg valueReg urlLo urlHi url[urlLen] bodyLo bodyHi body[bodyLen]
+  //      method 0=GET 1=POST. URL/body are raw ASCII (7-bit). On execution:
+  //        R[statusReg] = HTTP status (0 = Wi-Fi down / error)
+  //        R[valueReg]  = first integer parsed from the response body (0 if none)
+  //      and, if a host is connected, the status + body are sent back as a
+  //      SCHED_EXT_HTTP_REPLY. The request blocks the loop until it completes.
+  func doHttp(_ p: [UInt8], _ plen: Int) {
+    if plen < 6 { return }
+    let method    = p[1]
+    let statusReg = Int(p[2] & 0x0F)
+    let valueReg  = Int(p[3] & 0x0F)
+    let urlLen    = Int(p[4]) | (Int(p[5]) << 7)
+    var i = 6
+    if urlLen <= 0 || i + urlLen > plen { return }
+    var url = [UInt8](repeating: 0, count: urlLen + 1)        // null-terminated
+    for k in 0..<urlLen { url[k] = p[i + k] }
+    i += urlLen
+    var bodyLen = 0
+    if i + 2 <= plen { bodyLen = Int(p[i]) | (Int(p[i + 1]) << 7); i += 2 }
+    if bodyLen < 0 || i + bodyLen > plen { bodyLen = 0 }
+    var body = [UInt8](repeating: 0, count: bodyLen + 1)      // null-terminated
+    for k in 0..<bodyLen { body[k] = p[i + k] }
+
+    let status = url.withUnsafeBufferPointer { up -> Int32 in
+      body.withUnsafeBufferPointer { bp in
+        Int32(fm_http_request(up.baseAddress, Int32(method == 1 ? 1 : 0),
+                              bp.baseAddress, cs("application/json")))
+      }
+    }
+    regs[statusReg] = status
+
+    // Parse the first integer from the response into the value register.
+    let rlen = Int(fm_http_resp_len())
+    if rlen > 0 {
+      var n = rlen; if n > HTTP_REPLY_MAX { n = HTTP_REPLY_MAX }
+      var rb = [UInt8](repeating: 0, count: n)
+      let got = Int(rb.withUnsafeMutableBufferPointer { fm_http_resp_copy($0.baseAddress, Int32(n)) })
+      regs[valueReg] = parseFirstInt(rb, got)
+    } else {
+      regs[valueReg] = 0
+    }
+
+    if transportConnected() { sendHttpReply(Int(status)) }
+  }
+
+  // Send the last HTTP result (status + body) to the connected host.
+  func sendHttpReply(_ status: Int) {
+    var n = 0
+    frameBuf[n] = START_SYSEX;          n += 1
+    frameBuf[n] = SCHEDULER_DATA;       n += 1
+    frameBuf[n] = SCHED_EXT_HTTP_REPLY; n += 1
+    frameBuf[n] = UInt8(status & 0x7F);        n += 1
+    frameBuf[n] = UInt8((status >> 7) & 0x7F); n += 1
+    var rlen = Int(fm_http_resp_len())
+    if rlen > HTTP_REPLY_MAX { rlen = HTTP_REPLY_MAX }
+    if rlen > 0 {
+      var rb = [UInt8](repeating: 0, count: rlen)
+      let got = Int(rb.withUnsafeMutableBufferPointer { fm_http_resp_copy($0.baseAddress, Int32(rlen)) })
+      for k in 0..<got {                 // 14-bit LSB/MSB pairs (like STRING_DATA)
+        frameBuf[n] = rb[k] & 0x7F;        n += 1
+        frameBuf[n] = (rb[k] >> 7) & 0x7F; n += 1
+      }
+    }
+    frameBuf[n] = END_SYSEX; n += 1
+    sendFrame(frameBuf, n)
+  }
+
+  func handleSysex(_ payload: [UInt8], _ plen: Int) {
+    if plen < 1 { return }
+    switch payload[0] {
+    case SCHED_CREATE:
+      if plen == 4 { create(payload[1], UInt16(payload[2]) | (UInt16(payload[3]) << 7)) }
+    case SCHED_DELETE:
+      if plen == 2 { delete(payload[1]) }
+    case SCHED_ADD:
+      if plen > 2 {
+        var outLen = sched7BitOutBytes(plen - 2)
+        if outLen > MAX_TASK_BYTES { outLen = MAX_TASK_BYTES }
+        var dec = [UInt8](repeating: 0, count: MAX_TASK_BYTES)
+        sched7BitDecode(outLen, Array(payload[2..<plen]), &dec)
+        add(payload[1], dec, outLen)
+      }
+    case SCHED_DELAY:
+      if plen == 6 { delayRunning(sched7BitTime(Array(payload[1..<6]))) }
+    case SCHED_SCHEDULE:
+      if plen == 7 { schedule(payload[1], sched7BitTime(Array(payload[2..<7]))) }
+    case SCHED_EXT_COMMAND:             // 0x7F: logic ops live under the reserved ext cmd
+      if plen >= 2 { handleExt(Array(payload[1..<plen]), plen - 1) }
+    case SCHED_QUERY_ALL: queryAll()
+    case SCHED_QUERY:     if plen == 2 { queryTask(payload[1]) }
+    case SCHED_RESET:     reset()
+    default: break
+    }
+  }
+
+  // Replay a task until a delay reschedules it or it finishes. Returns true to keep it.
+  func execute(_ t: SchedTask) -> Bool {
+    let start = t.time_ms
+    running = t
+    replay.ps = ParserState()
+    while t.pos < t.len {
+      let b = t.data[Int(t.pos)]; t.pos += 1
+      replay.process(b)
+      if t.time_ms != start {               // a DELAY_TASK fired
+        if t.pos >= t.len { t.pos = 0 }      // trailing delay -> loop from start
+        running = nil
+        return true
+      }
+    }
+    running = nil
+    return false
+  }
+
+  func tick() {
+    let now = fm_millis()
+    for i in 0..<MAX_TASKS {
+      let t = tasks[i]
+      if t.used && t.time_ms != 0 && Int32(bitPattern: now &- t.time_ms) >= 0 {
+        if !execute(t) { t.used = false }
+      }
     }
   }
 }
@@ -816,7 +930,7 @@ func sampleAnalogAndI2C() {
 //  Reset
 // ===========================================================================
 func resetSessionState() {
-  liveParser = ParserState()
+  liveHandler.ps = ParserState()
   analogReportMask = 0
   for i in 0..<NUM_PORTS { reportPort[i] = false; previousPort[i] = 0 }
   for i in 0..<MAX_CONT_READS { contReads[i].active = false }
@@ -824,8 +938,8 @@ func resetSessionState() {
 
 func systemResetState() {
   resetSessionState()
-  taskParser = ParserState()
-  schedReset()
+  replayHandler.ps = ParserState()
+  scheduler.reset()
   for pin in 0..<TOTAL_PINS {
     if isUsable(pin) { fm_pin_mode(Int32(pin), 0) }
     pinModes[pin] = PIN_MODE_INPUT
@@ -869,7 +983,7 @@ func transportConnected() -> Bool { activeTransport != TR_NONE }
 //  Periodic work (scheduler + sampling), run each loop iteration
 // ===========================================================================
 func loopTick() {
-  schedTick()
+  scheduler.tick()
   if transportConnected() {
     checkDigitalInputs()
     let now = fm_millis()
@@ -947,7 +1061,7 @@ func tcpPoll() {
   if fm_tcp_connected() == 0 && activeTransport == TR_TCP { activeTransport = TR_NONE }
   var g = 0
   while fm_tcp_connected() != 0 && fm_tcp_available() != 0 && g < 1024 {
-    processByte(&liveParser, UInt8(fm_tcp_read() & 0xFF)); g += 1
+    liveHandler.process(UInt8(fm_tcp_read() & 0xFF)); g += 1
   }
 }
 
@@ -978,7 +1092,7 @@ func blePoll() {
   }
   var g = 0
   var b = fm_ble_rx_pop()
-  while b >= 0 && g < 4096 { processByte(&liveParser, UInt8(b & 0xFF)); g += 1; b = fm_ble_rx_pop() }
+  while b >= 0 && g < 4096 { liveHandler.process(UInt8(b & 0xFF)); g += 1; b = fm_ble_rx_pop() }
 }
 
 // ===========================================================================
@@ -986,6 +1100,11 @@ func blePoll() {
 // ===========================================================================
 @_cdecl("sw_main")
 public func sw_main() {
+  // Wire the handler/scheduler cross-references (singletons that live forever).
+  liveHandler.sched   = scheduler
+  replayHandler.sched = scheduler
+  scheduler.replay    = replayHandler
+
   fm_serial_begin(115200)
   fm_delay_ms(200)
   fm_log(cs("=== ESP32 Firmata (Embedded Swift) : FirmataESP32 ==="))

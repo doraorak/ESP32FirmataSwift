@@ -39,6 +39,11 @@ int  fm_mdns_begin(const uint8_t *host);
 void fm_mdns_add_service(const uint8_t *svc, const uint8_t *proto, int port);
 void fm_mdns_add_txt(const uint8_t *svc, const uint8_t *proto, const uint8_t *k, const uint8_t *v);
 
+// --- HTTP client (over Wi-Fi) ---
+int fm_http_request(const uint8_t *url, int is_post, const uint8_t *body, const uint8_t *content_type);
+int fm_http_resp_len(void);
+int fm_http_resp_copy(uint8_t *dst, int max);
+
 // --- TCP server / client ---
 void fm_tcp_begin(int port);
 int  fm_tcp_poll_new(void);
