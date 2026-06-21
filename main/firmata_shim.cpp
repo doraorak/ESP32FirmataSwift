@@ -16,9 +16,16 @@
 //===----------------------------------------------------------------------===//
 #include "Arduino.h"
 #include "WiFi.h"
+#include "WiFiClientSecure.h"   // HTTPS (TLS via ssl_client / mbedTLS)
 #include "HTTPClient.h"
 #include "ESPmDNS.h"
 #include "Wire.h"
+
+// IDF certificate bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y) — browser-like
+// root CA set, so HTTPS certs are validated. Same approach works in the Arduino
+// sketch (the core embeds the same bundle).
+extern const uint8_t fm_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t fm_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
 #include "BLEDevice.h"
 #include "BLEServer.h"
 #include "BLEUtils.h"
@@ -92,12 +99,23 @@ int fm_http_request(const uint8_t *url, int is_post,
                     const uint8_t *body, const uint8_t *content_type) {
   httpBody = "";
   if (WiFi.status() != WL_CONNECTED) return 0;
+  bool https = (strncmp((const char *)url, "https", 5) == 0);
   HTTPClient http;
   http.setConnectTimeout(8000);
   http.setTimeout(8000);
   http.setReuse(false);
-  WiFiClient plain;                          // plain HTTP only (see note below)
-  if (!http.begin(plain, (const char *)url)) return 0;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  WiFiClientSecure tls;
+  WiFiClient plain;
+  bool ok;
+  if (https) {
+    tls.setCACertBundle(fm_crt_bundle_start,
+                        (size_t)(fm_crt_bundle_end - fm_crt_bundle_start));  // validate certs
+    ok = http.begin(tls, (const char *)url);
+  } else {
+    ok = http.begin(plain, (const char *)url);
+  }
+  if (!ok) return 0;
   int code;
   if (is_post) {
     if (content_type && content_type[0]) http.addHeader("Content-Type", (const char *)content_type);

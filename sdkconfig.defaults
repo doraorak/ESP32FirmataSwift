@@ -25,3 +25,11 @@ CONFIG_LINKER_ORPHAN_HANDLING_PLACE=y
 # ---- Board has 4 MB flash (needed for the 3 MB app partition) ----
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# ---- HTTPS: Arduino's ssl_client.cpp compiles its body only when a PSK key
+#      exchange is enabled (defines MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED);
+#      otherwise WiFiClientSecure fails to link. Cert bundle validates certs. ----
+CONFIG_MBEDTLS_PSK_MODES=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
