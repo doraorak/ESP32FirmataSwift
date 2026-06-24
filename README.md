@@ -12,6 +12,25 @@ Part of a three-repo Firmata-for-ESP32 suite — grab whichever piece you need:
 - **[ESP32Firmata](https://github.com/doraorak/ESP32Firmata)** — the C++/Arduino firmware port (same wire protocol).
 - **[SwiftFirmataClient](https://github.com/doraorak/SwiftFirmataClient)** — the macOS/iOS Swift client package.
 
+## Flash it
+
+Plug the board into USB, then from this folder in Terminal:
+
+```bash
+./flash.sh      # auto-detects the port, builds + flashes (first build is slow)
+./monitor.sh    # serial log — shows the board's Wi-Fi IP / Bonjour name
+```
+
+`flash.sh` sources ESP-IDF and runs `idf.py flash` for you (override the IDF path with
+`IDF_EXPORT=…`, or the port with `./flash.sh /dev/cu.XXXX`). For the manual steps and the
+one-time toolchain setup, see **Build & flash** below.
+
+Prefer not to build? A **prebuilt `.bin`** is attached to each
+[release](https://github.com/doraorak/ESP32FirmataSwift/releases) — flash it with `esptool`
+or [ESP Web Tools](https://esp.huhn.me). Note it carries **placeholder Wi-Fi credentials**
+(so it won't join Wi-Fi out of the box — BLE still works); rebuild from source with your own
+SSID/password to use Wi-Fi.
+
 The Firmata protocol, the Scheduler, and the on-device register / `if` / `else`
 logic extension are all written in Embedded Swift; the Arduino peripheral APIs
 and both transports — **Wi-Fi/TCP + Bonjour** and **BLE (Nordic UART Service)**,
