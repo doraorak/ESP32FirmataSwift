@@ -128,6 +128,39 @@ int fm_http_request(const uint8_t *url, int is_post,
   return code;
 }
 int fm_http_resp_len(void) { return (int)httpBody.length(); }
+// Borrow the retained body in place (Swift walks it directly — no copy).
+const uint8_t *fm_http_resp_ptr(void) { return (const uint8_t *)httpBody.c_str(); }
+// Heap stats so a task can size-gate before allocating.
+int fm_free_heap(void)         { return (int)ESP.getFreeHeap(); }
+int fm_largest_free_block(void) {
+  return (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+}
+
+// ---- JSON snapshot slots: owned copies of a response (sub)value that survive
+//      the next request. Grow-only buffers (realloc only when bigger) to avoid
+//      heap-fragmenting churn. Stable pointers so Swift can walk them in place.
+#define FM_NUM_SNAP 2
+static uint8_t *fm_snap[FM_NUM_SNAP]   = {nullptr, nullptr};
+static int      fm_snapCap[FM_NUM_SNAP] = {0, 0};
+static int      fm_snapLen[FM_NUM_SNAP] = {0, 0};
+// Returns 1 on success, 0 on alloc failure.
+int fm_snapshot_copy(int slot, const uint8_t *src, int len) {
+  if (slot < 0 || slot >= FM_NUM_SNAP || len < 0) return 0;
+  if (len > fm_snapCap[slot]) {                 // grow-only: never shrink the buffer
+    uint8_t *nb = (uint8_t *)realloc(fm_snap[slot], (size_t)len);
+    if (!nb) { return 0; }
+    fm_snap[slot] = nb; fm_snapCap[slot] = len;
+  }
+  if (len > 0) memcpy(fm_snap[slot], src, (size_t)len);
+  fm_snapLen[slot] = len;
+  return 1;
+}
+const uint8_t *fm_snapshot_ptr(int slot) { return (slot >= 0 && slot < FM_NUM_SNAP) ? fm_snap[slot] : nullptr; }
+int fm_snapshot_len(int slot)            { return (slot >= 0 && slot < FM_NUM_SNAP) ? fm_snapLen[slot] : 0; }
+void fm_snapshot_free(int slot) {
+  if (slot < 0 || slot >= FM_NUM_SNAP) return;
+  free(fm_snap[slot]); fm_snap[slot] = nullptr; fm_snapCap[slot] = 0; fm_snapLen[slot] = 0;
+}
 int fm_http_resp_copy(uint8_t *dst, int max) {
   int n = (int)httpBody.length();
   if (n > max) n = max;

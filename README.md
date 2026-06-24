@@ -4,6 +4,14 @@ A faithful, section-by-section port of the original cpp
 [**ESP32Firmata**](https://github.com/doraorak/ESP32Firmata) (Firmata 2.x
 firmware) to **Embedded Swift**, running on the **original ESP32 (Xtensa LX6)**.
 
+## The project suite
+
+Part of a three-repo Firmata-for-ESP32 suite — grab whichever piece you need:
+
+- **[ESP32FirmataSwift](https://github.com/doraorak/ESP32FirmataSwift)** — Embedded-Swift ESP32 firmware *(this repo)*.
+- **[ESP32Firmata](https://github.com/doraorak/ESP32Firmata)** — the C++/Arduino firmware port (same wire protocol).
+- **[SwiftFirmataClient](https://github.com/doraorak/SwiftFirmataClient)** — the macOS/iOS Swift client package.
+
 The Firmata protocol, the Scheduler, and the on-device register / `if` / `else`
 logic extension are all written in Embedded Swift; the Arduino peripheral APIs
 and both transports — **Wi-Fi/TCP + Bonjour** and **BLE (Nordic UART Service)**,
@@ -183,12 +191,29 @@ JSON_NUM       F0 7B 7F 16 <dst> <found> <scale> <pathLen:2> <path…>     F7
 JSON_STR_EQ    F0 7B 7F 17 <dst> <pathLen:2> <path…> <strLen:2> <str…>   F7
 BODY_CONTAINS  F0 7B 7F 18 <dst> <strLen:2> <str…>                       F7
 JSON_STR_CONT  F0 7B 7F 19 <dst> <pathLen:2> <path…> <strLen:2> <str…>   F7
-HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  // device -> host
+ARITH          F0 7B 7F 1A <subop> <dst> <operandA> <operandB>          F7  // R[dst] = A op B (int)
+SET_FLOAT      F0 7B 7F 1B <fdst> <const:5>                             F7  // F[fdst] = float
+ARITH_F        F0 7B 7F 1C <subop> <fdst> <operandA> <operandB>         F7  // F[fdst] = A op B (float)
+JSON_FLOAT     F0 7B 7F 1D <fdst> <found> <pathLen:2> <path…>           F7  // F[fdst] = json float
+JSON_TYPE      F0 7B 7F 1E <dst> <pathLen:2> <path…>                    F7  // R[dst] = type at path
+JSON_SIZE      F0 7B 7F 1F <dst> <pathLen:2> <path…>                    F7  // R[dst] = span byte length
+STR_LEN        F0 7B 7F 20 <dst> <pathLen:2> <path…>                    F7  // R[dst] = string content length
+HEAP           F0 7B 7F 21 <freeReg> <largestReg>                       F7  // R = free heap / largest block
+BODY_GEN       F0 7B 7F 22 <dst>                                        F7  // R[dst] = response generation
+SNAPSHOT       F0 7B 7F 23 <slot> <pathLen:2> <path…>                   F7  // copy value -> snapshot slot
+SELECT         F0 7B 7F 24 <sel> <expGenReg>                            F7  // 0=live(gen-checked), k=snap k-1
+FREE           F0 7B 7F 25 <slot>                                       F7  // free a snapshot slot
+LAST_STATUS    F0 7B 7F 26 <dst>                                        F7  // R[dst] = last inspection status
+CMP            F0 7B 7F 27 <op> <dst> <operandA> <operandB>             F7  // R[dst] = (A op B) ? 1 : 0
+HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                 F7  // device -> host
 ```
 
-* `<reg>`: register index, low nibble (`0`–`15`).
+* `<reg>`: int register index, low nibble (`0`–`15`). `<fdst>`: float register (`0`–`7`).
 * `<op>`: `0 ==`, `1 !=`, `2 <`, `3 >`, `4 <=`, `5 >=`.
-* `<operand>`: type byte then data — `00 <reg>` (register) or `01 <const:5>` (literal).
+* `<operand>`: type byte then data — `00 <reg>` (int register), `01 <const:5>` (int
+  literal), `02 <freg>` (float register), or `03 <const:5>` (float literal, IEEE754
+  bits). `IF`/`ARITH` accept any type; if either side is float the device promotes
+  the comparison/op to float.
 * `<channel>`: analog channel index (A0 = 0…), **not** a pin.
 * `if`/`else`: `[IF skip=thenLen] [then…] [SKIP skip=elseLen] [else…]`.
 * `HTTP` (`0x15`): `<method>` `0`=GET `1`=POST. Sets `R[statusReg]`=HTTP status
@@ -196,9 +221,31 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                  F7  /
   `Content-Type: application/json`.
 * `JSON_NUM` (`0x16`): `R[dst]` = number at `<path>` × 10^`<scale>` (truncated),
   `R[found]` = `1`/`0`. `<path>` is dotted/indexed, e.g. `result[0].changePercent`.
+  Also parses a **quoted** number (`"593.2"`). Inspection walks the **full** body
+  in place (no copy, no parse-size cap).
 * `JSON_STR_EQ`/`JSON_STR_CONT` (`0x17`/`0x19`): `R[dst]` = `1`/`0` from comparing
   the JSON string at `<path>`. `BODY_CONTAINS` (`0x18`): `R[dst]` = `1`/`0`
   substring search over the whole body.
+* `ARITH` (`0x1A`): `<subop>` `0`=+ `1`=− `2`=× `3`=÷ `4`=%. `R[dst]` = A op B (int).
+  64-bit intermediates avoid overflow; `÷`/`%` by zero yield `0`.
+* `CMP` (`0x27`): `R[dst]` = `(A <op> B) ? 1 : 0` using the same `<op>` codes and
+  operand decoding as `IF` (floats promote). Materialises a reusable boolean register
+  instead of branching inline — the host's `isValid()` uses it against `BODY_GEN`.
+* Floats: 8 registers `F0`–`F7`. `SET_FLOAT` (`0x1B`) loads a literal; `ARITH_F`
+  (`0x1C`, subops `0`=+ `1`=− `2`=× `3`=÷, `÷0`→0) does float math; `JSON_FLOAT`
+  (`0x1D`) reads a JSON number (quoted, fractional, or exponent) into `F[fdst]`,
+  `R[found]`=`1`/`0`. Mix freely with ints via the operand types (ints promote).
+* Query ops (inspect before extracting/storing): `JSON_TYPE` (`0x1E`) → `0` none,
+  `1` object, `2` array, `3` string, `4` number, `5` bool, `6` null. `JSON_SIZE`
+  (`0x1F`) → span byte length. `STR_LEN` (`0x20`) → string content length. `HEAP`
+  (`0x21`) → free heap + largest contiguous block, for size-gating an allocation.
+* Handles: `BODY_GEN` (`0x22`) reads the response generation (++ per request).
+  `SNAPSHOT` (`0x23`) copies a value into one of 2 grow-only slots that outlive the
+  next request. `SELECT` (`0x24`) sets the inspection source: `0` = live body
+  (marked **stale** if `bodyGen != R[expGenReg]`), `k` = snapshot slot `k-1`.
+  `FREE` (`0x25`) releases a slot. `LAST_STATUS` (`0x26`) → the last inspection op's
+  status (`0` ok, `1` notFound, `2` stale, `3` typeMismatch, `4` tooBig, `5` allocFailed).
+  Inspection ops read the selected source and record their status.
 * `HTTP_REPLY` carries the status (`lo hi`) + body (14-bit pairs, up to ~4 KB)
   back to a connected host.
 

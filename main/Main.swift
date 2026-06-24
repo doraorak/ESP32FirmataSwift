@@ -79,6 +79,29 @@ let SCHED_EXT_JSON_NUM: UInt8     = 0x16   // R[dst] = json number at <path> ×1
 let SCHED_EXT_JSON_STR_EQ: UInt8  = 0x17   // R[dst] = (json string at <path> == <str>) ? 1 : 0
 let SCHED_EXT_BODY_CONTAINS: UInt8 = 0x18  // R[dst] = body contains <str> ? 1 : 0
 let SCHED_EXT_JSON_STR_CONTAINS: UInt8 = 0x19 // R[dst] = (json string at <path> contains <str>) ? 1 : 0
+let SCHED_EXT_ARITH: UInt8        = 0x1A   // R[dst] = A <op> B  (op: 0+ 1- 2* 3/ 4%)
+let SCHED_EXT_SET_FLOAT: UInt8    = 0x1B   // F[dst] = float const (IEEE754 bits in 5 bytes)
+let SCHED_EXT_ARITH_FLOAT: UInt8      = 0x1C   // F[dst] = A <op> B (float; op 0+ 1- 2* 3/)
+let SCHED_EXT_JSON_FLOAT: UInt8   = 0x1D   // F[dst] = json float at <path>; R[found]=0/1
+let SCHED_EXT_JSON_TYPE: UInt8    = 0x1E   // R[dst] = type at <path> (0 none,1 obj,2 arr,3 str,4 num,5 bool,6 null)
+let SCHED_EXT_JSON_SIZE: UInt8    = 0x1F   // R[dst] = byte length of value span at <path> (0 if none)
+let SCHED_EXT_STR_LEN: UInt8      = 0x20   // R[dst] = content length of json string at <path> (0 if not string)
+let SCHED_EXT_HEAP: UInt8         = 0x21   // R[freeReg]=free heap, R[largestReg]=largest free block
+let SCHED_EXT_REQUEST_COUNT: UInt8     = 0x22   // R[dst] = current response generation (++ per request)
+let SCHED_EXT_SNAPSHOT: UInt8     = 0x23   // copy value at <path> from live body into snapshot slot
+let SCHED_EXT_SELECT: UInt8       = 0x24   // pick the inspection source (0=live, k=snapshot k-1)
+let SCHED_EXT_FREE: UInt8         = 0x25   // free a snapshot slot
+let SCHED_EXT_LAST_STATUS: UInt8  = 0x26   // R[dst] = status of the last inspection op
+let SCHED_EXT_CMP: UInt8          = 0x27   // R[dst] = (A <op> B) ? 1 : 0  (op: 0== 1!= 2< 3> 4<= 5>=)
+
+// Result-status codes (read with SCHED_EXT_LAST_STATUS).
+let ST_OK: Int32            = 0
+let ST_NOT_FOUND: Int32     = 1
+let ST_STALE: Int32         = 2
+let ST_TYPE_MISMATCH: Int32 = 3
+let ST_TOO_BIG: Int32       = 4
+let ST_ALLOC_FAILED: Int32  = 5
+let NUM_SNAP = 2
 
 // Pin modes
 let PIN_MODE_INPUT: UInt8  = 0x00
@@ -160,6 +183,7 @@ let MAX_CONT_READS = 8
 var contReads = [ContinuousRead](repeating: ContinuousRead(), count: MAX_CONT_READS)
 
 let NUM_SCHED_REGS = 16
+let NUM_FLOAT_REGS = 8
 
 // Live protocol handler, scheduler, and the dedicated handler for task replay.
 // Their cross-references are wired once at startup in sw_main().
@@ -295,7 +319,7 @@ func sendI2CReply(_ address: UInt16, _ reg: Int, _ data: [UInt8], _ count: Int) 
 // ===========================================================================
 //  I2C device helpers (shared by the live handler and periodic sampling)
 // ===========================================================================
-func i2cDoRead(_ address: UInt16, _ reg: Int, _ count0: UInt16) {
+func i2cRead(_ address: UInt16, _ reg: Int, _ count0: UInt16) {
   if reg >= 0 {
     fm_i2c_begin_transmission(Int32(address))
     fm_i2c_write(Int32(reg))
@@ -432,13 +456,13 @@ final class FirmataProtocol {
     if tenbit { address |= UInt16(control & 0x07) << 7 }
 
     let poff = 2
-    let plen = len - 2
+    let payloadLen = len - 2
 
     switch mode {
     case 0:  // WRITE
       fm_i2c_begin_transmission(Int32(address))
       var i = 0
-      while i + 1 < plen {
+      while i + 1 < payloadLen {
         let b = (data[poff + i] & 0x7F) | ((data[poff + i + 1] & 0x7F) << 7)
         fm_i2c_write(Int32(b)); i += 2
       }
@@ -446,19 +470,19 @@ final class FirmataProtocol {
       _ = fm_i2c_end_transmission(restart ? 0 : 1)   // restart -> no STOP
     case 1:  // READ_ONCE
       var reg = -1; var count: UInt16 = 0
-      if plen >= 4 {
+      if payloadLen >= 4 {
         reg   = Int(data[poff] & 0x7F) | (Int(data[poff + 1] & 0x7F) << 7)
         count = UInt16(data[poff + 2] & 0x7F) | (UInt16(data[poff + 3] & 0x7F) << 7)
-      } else if plen >= 2 {
+      } else if payloadLen >= 2 {
         count = UInt16(data[poff] & 0x7F) | (UInt16(data[poff + 1] & 0x7F) << 7)
       }
-      i2cDoRead(address, reg, count)
+        i2cRead(address, reg, count)
     case 2:  // READ_CONTINUOUS
       var reg = -1; var count: UInt16 = 0
-      if plen >= 4 {
+      if payloadLen >= 4 {
         reg   = Int(data[poff] & 0x7F) | (Int(data[poff + 1] & 0x7F) << 7)
         count = UInt16(data[poff + 2] & 0x7F) | (UInt16(data[poff + 3] & 0x7F) << 7)
-      } else if plen >= 2 {
+      } else if payloadLen >= 2 {
         count = UInt16(data[poff] & 0x7F) | (UInt16(data[poff + 1] & 0x7F) << 7)
       }
       addContinuousRead(address, reg, count)
@@ -587,9 +611,9 @@ func sched7BitOutBytes(_ encodedLen: Int) -> Int { (encodedLen * 7) >> 3 }
 
 // Decode a 32-bit little-endian value from 5 Encoder7Bit-packed bytes.
 func sched7BitTime(_ enc5: [UInt8]) -> UInt32 {
-  var b = [UInt8](repeating: 0, count: 4)
-  sched7BitDecode(4, enc5, &b)
-  return UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24)
+  var decoded = [UInt8](repeating: 0, count: 4)
+  sched7BitDecode(4, enc5, &decoded)
+  return UInt32(decoded[0]) | (UInt32(decoded[1]) << 8) | (UInt32(decoded[2]) << 16) | (UInt32(decoded[3]) << 24)
 }
 
 // Encoder7Bit encode one byte into frameBuf, carrying state in shift/prev.
@@ -619,6 +643,11 @@ final class Scheduler {
   }()
   var running: SchedTask? = nil
   var regs = [Int32](repeating: 0, count: NUM_SCHED_REGS)
+  var fregs = [Float](repeating: 0, count: NUM_FLOAT_REGS)
+  var requestCount: Int32 = 0           // ++ on each HTTP request; basis for handle staleness (3b2)
+  var inspectSel = 0               // inspection source: 0 = live body, k = snapshot slot k-1
+  var inspectStale = false         // borrowed source selected after a newer request
+  var lastStatus: Int32 = 0        // result-status of the last inspection op
   var replay: FirmataProtocol!     // wired once at startup (see sw_main)
 
   func find(_ id: UInt8) -> SchedTask? {
@@ -629,6 +658,10 @@ final class Scheduler {
   func reset() {
     for i in 0..<MAX_TASKS { tasks[i].used = false }
     for i in 0..<NUM_SCHED_REGS { regs[i] = 0 }
+    for i in 0..<NUM_FLOAT_REGS { fregs[i] = 0 }
+    requestCount = 0
+    inspectSel = 0; inspectStale = false; lastStatus = 0
+    for s in 0..<NUM_SNAP { fm_snapshot_free(Int32(s)) }
     running = nil
   }
 
@@ -700,67 +733,122 @@ final class Scheduler {
   }
 
   // ---- NON-STANDARD logic extension (NONSTANDARD.md) ----
-  func compare(_ op: UInt8, _ a: Int32, _ b: Int32) -> Bool {
+  // An operand carries both an int and a float view; `isFloat` says which one is
+  // authoritative (so a comparison promotes to float when either side is float).
+  struct Operand { var isFloat: Bool; var i: Int32; var f: Float }
+
+  // Trap-free Float → Int32 (NaN/overflow clamp).
+  func f2i(_ x: Float) -> Int32 {
+    if x.isNaN { return 0 }
+    if x >= 2147483520.0 { return Int32.max }
+    if x <= -2147483520.0 { return Int32.min }
+    return Int32(x)
+  }
+
+  func compare(_ op: UInt8, _ a: Operand, _ b: Operand) -> Bool {
+    if a.isFloat || b.isFloat {
+      let x = a.f, y = b.f
+      switch op {
+      case 0: return x == y; case 1: return x != y; case 2: return x <  y
+      case 3: return x >  y; case 4: return x <= y; case 5: return x >= y
+      default: return false
+      }
+    }
+    let x = a.i, y = b.i
     switch op {
-    case 0: return a == b
-    case 1: return a != b
-    case 2: return a <  b
-    case 3: return a >  b
-    case 4: return a <= b
-    case 5: return a >= b
+    case 0: return x == y; case 1: return x != y; case 2: return x <  y
+    case 3: return x >  y; case 4: return x <= y; case 5: return x >= y
     default: return false
     }
   }
 
-  func readOperand(_ payload: [UInt8], _ plen: Int, _ i: inout Int) -> Int32 {
-    if i >= plen { return 0 }
+  // Operand types: 00 int reg, 01 int const, 02 float reg, 03 float const.
+  func readOperand(_ payload: [UInt8], _ payloadLen: Int, _ i: inout Int) -> Operand {
+    if i >= payloadLen { return Operand(isFloat: false, i: 0, f: 0) }
     let type = payload[i]; i += 1
-    if type == 0 {                     // register
-      if i >= plen { return 0 }
-      let r = regs[Int(payload[i] & 0x0F)]; i += 1; return r
-    } else {                           // constant (5 Encoder7Bit bytes)
-      if i + 5 > plen { i = plen; return 0 }
-      let v = Int32(bitPattern: sched7BitTime(Array(payload[i..<i+5]))); i += 5; return v
+    switch type {
+    case 0:                            // int register
+      let v = (i < payloadLen) ? regs[Int(payload[i] & 0x0F)] : 0; i += 1
+      return Operand(isFloat: false, i: v, f: Float(v))
+    case 2:                            // float register
+      let r = (i < payloadLen) ? fregs[Int(payload[i] & UInt8(NUM_FLOAT_REGS - 1))] : 0; i += 1
+      return Operand(isFloat: true, i: f2i(r), f: r)
+    case 3:                            // float constant (IEEE754 bits, 5 Encoder7Bit bytes)
+      if i + 5 > payloadLen { i = payloadLen; return Operand(isFloat: false, i: 0, f: 0) }
+      let fv = Float(bitPattern: sched7BitTime(Array(payload[i..<i+5]))); i += 5
+      return Operand(isFloat: true, i: f2i(fv), f: fv)
+    default:                           // 01 = int constant (5 Encoder7Bit bytes)
+      if i + 5 > payloadLen { i = payloadLen; return Operand(isFloat: false, i: 0, f: 0) }
+      let v = Int32(bitPattern: sched7BitTime(Array(payload[i..<i+5]))); i += 5
+      return Operand(isFloat: false, i: v, f: Float(v))
     }
   }
 
   func skip(_ amount: UInt16) {
     guard let t = running else { return }
-    let p = UInt32(t.pos) + UInt32(amount)
-    t.pos = (p > UInt32(t.len)) ? t.len : UInt16(p)
+    let newPos = UInt32(t.pos) + UInt32(amount)
+    t.pos = (newPos > UInt32(t.len)) ? t.len : UInt16(newPos)
   }
 
-  func handleExt(_ payload: [UInt8], _ plen: Int) {
+  func handleExt(_ payload: [UInt8], _ payloadLen: Int) {
     switch payload[0] {
     case SCHED_EXT_SET:                 // 0x10 reg <const:5>
-      if plen == 7 { regs[Int(payload[1] & 0x0F)] = Int32(bitPattern: sched7BitTime(Array(payload[2..<7]))) }
+      if payloadLen == 7 { regs[Int(payload[1] & 0x0F)] = Int32(bitPattern: sched7BitTime(Array(payload[2..<7]))) }
     case SCHED_EXT_READ_DIGITAL:        // 0x11 reg pin
-      if plen == 3 { regs[Int(payload[1] & 0x0F)] = (digitalRead(payload[2]) != 0) ? 1 : 0 }
+      if payloadLen == 3 { regs[Int(payload[1] & 0x0F)] = (digitalRead(payload[2]) != 0) ? 1 : 0 }
     case SCHED_EXT_READ_ANALOG:         // 0x12 reg channel
-      if plen == 3 {
+      if payloadLen == 3 {
         let pin = pinOfAnalogChannel(Int(payload[2]))
         regs[Int(payload[1] & 0x0F)] = (pin >= 0) ? Int32(analogRead(UInt8(pin))) : 0
       }
     case SCHED_EXT_IF:                  // 0x13 op <operandA> <operandB> skipLo skipHi
       var i = 1
       let op = payload[i]; i += 1
-      let a = readOperand(payload, plen, &i)
-      let b = readOperand(payload, plen, &i)
-      if i + 2 > plen { break }
+      let a = readOperand(payload, payloadLen, &i)
+      let b = readOperand(payload, payloadLen, &i)
+      if i + 2 > payloadLen { break }
       let amount = UInt16(payload[i]) | (UInt16(payload[i + 1]) << 7)
       if !compare(op, a, b) { skip(amount) }
     case SCHED_EXT_SKIP:                // 0x14 skipLo skipHi
-      if plen == 3 { skip(UInt16(payload[1]) | (UInt16(payload[2]) << 7)) }
+      if payloadLen == 3 { skip(UInt16(payload[1]) | (UInt16(payload[2]) << 7)) }
     case SCHED_EXT_HTTP:               // 0x15 internet request (see NONSTANDARD.md)
-      doHttp(payload, plen)
+      http(payload, payloadLen)
     case SCHED_EXT_JSON_NUM:           // 0x16 dst found scale pathLo pathHi path…
-      doJsonNum(payload, plen)
+      jsonNumber(payload, payloadLen)
     case SCHED_EXT_JSON_STR_EQ:        // 0x17 dst pathLo pathHi path… strLo strHi str…
-      doJsonStr(payload, plen, contains: false)
+      jsonString(payload, payloadLen, contains: false)
     case SCHED_EXT_BODY_CONTAINS:      // 0x18 dst strLo strHi str…
-      doBodyContains(payload, plen)
+      bodyContains(payload, payloadLen)
     case SCHED_EXT_JSON_STR_CONTAINS:  // 0x19 dst pathLo pathHi path… strLo strHi str…
-      doJsonStr(payload, plen, contains: true)
+      jsonString(payload, payloadLen, contains: true)
+    case SCHED_EXT_ARITH:              // 0x1A subop dst <operandA> <operandB>
+      arith(payload, payloadLen)
+    case SCHED_EXT_SET_FLOAT:          // 0x1B fdst <const:5>
+      setFloat(payload, payloadLen)
+    case SCHED_EXT_ARITH_FLOAT:            // 0x1C subop fdst <operandA> <operandB>
+      arithFloat(payload, payloadLen)
+    case SCHED_EXT_JSON_FLOAT:         // 0x1D fdst found pathLo pathHi path…
+      jsonFloat(payload, payloadLen)
+    case SCHED_EXT_JSON_TYPE:          // 0x1E dst pathLo pathHi path…
+      jsonType(payload, payloadLen)
+    case SCHED_EXT_JSON_SIZE:          // 0x1F dst pathLo pathHi path…
+      jsonSize(payload, payloadLen)
+    case SCHED_EXT_STR_LEN:            // 0x20 dst pathLo pathHi path…
+      strLen(payload, payloadLen)
+    case SCHED_EXT_HEAP:               // 0x21 freeReg largestReg
+      heap(payload, payloadLen)
+    case SCHED_EXT_REQUEST_COUNT:           // 0x22 dst
+      readRequestCount(payload, payloadLen)
+    case SCHED_EXT_SNAPSHOT:           // 0x23 slot pathLo pathHi path…
+      snapshot(payload, payloadLen)
+    case SCHED_EXT_SELECT:             // 0x24 sel expGenReg
+      select(payload, payloadLen)
+    case SCHED_EXT_FREE:               // 0x25 slot
+      free(payload, payloadLen)
+    case SCHED_EXT_LAST_STATUS:        // 0x26 dst
+      lastStatus(payload, payloadLen)
+    case SCHED_EXT_CMP:                // 0x27 op dst <operandA> <operandB>
+      cmp(payload, payloadLen)
     default:
       break
     }
@@ -773,21 +861,21 @@ final class Scheduler {
   //      R[statusReg] = HTTP status (0 = Wi-Fi down / error); the full response
   //      body is retained for the inspection ops (JSON_NUM / *_STR_* / BODY_*).
   //      If a host is connected, status + body are also sent as SCHED_EXT_HTTP_REPLY.
-  func doHttp(_ p: [UInt8], _ plen: Int) {
-    if plen < 5 { return }
-    let method    = p[1]
-    let statusReg = Int(p[2] & 0x0F)
-    let urlLen    = Int(p[3]) | (Int(p[4]) << 7)
+  func http(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 5 { return }
+    let method    = payload[1]
+    let statusReg = Int(payload[2] & 0x0F)
+    let urlLen    = Int(payload[3]) | (Int(payload[4]) << 7)
     var i = 5
-    if urlLen <= 0 || i + urlLen > plen { return }
+    if urlLen <= 0 || i + urlLen > payloadLen { return }
     var url = [UInt8](repeating: 0, count: urlLen + 1)        // null-terminated
-    for k in 0..<urlLen { url[k] = p[i + k] }
+    for k in 0..<urlLen { url[k] = payload[i + k] }
     i += urlLen
     var bodyLen = 0
-    if i + 2 <= plen { bodyLen = Int(p[i]) | (Int(p[i + 1]) << 7); i += 2 }
-    if bodyLen < 0 || i + bodyLen > plen { bodyLen = 0 }
+    if i + 2 <= payloadLen { bodyLen = Int(payload[i]) | (Int(payload[i + 1]) << 7); i += 2 }
+    if bodyLen < 0 || i + bodyLen > payloadLen { bodyLen = 0 }
     var body = [UInt8](repeating: 0, count: bodyLen + 1)      // null-terminated
-    for k in 0..<bodyLen { body[k] = p[i + k] }
+    for k in 0..<bodyLen { body[k] = payload[i + k] }
 
     let status = url.withUnsafeBufferPointer { up -> Int32 in
       body.withUnsafeBufferPointer { bp in
@@ -796,181 +884,344 @@ final class Scheduler {
       }
     }
     regs[statusReg] = status
+    requestCount &+= 1                   // the retained body just changed (handle-staleness basis)
     if transportConnected() { sendHttpReply(Int(status)) }
   }
 
-  // ====== Response inspection (operate on the last retained HTTP body) ======
+  // 0x22: R[dst] = current response generation (increments on every request).
+  func readRequestCount(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 2 { return }
+    regs[Int(payload[1] & 0x0F)] = requestCount
+  }
 
-  // Copy the retained HTTP response body into a Swift buffer (capped for parsing).
-  func responseBody() -> [UInt8] {
-    let n0 = Int(fm_http_resp_len())
-    if n0 <= 0 { return [] }
-    var n = n0; if n > HTTP_PARSE_MAX { n = HTTP_PARSE_MAX }
-    var b = [UInt8](repeating: 0, count: n)
-    let got = Int(b.withUnsafeMutableBufferPointer { fm_http_resp_copy($0.baseAddress, Int32(n)) })
-    if got < n { b.removeLast(n - got) }
-    return b
+  // ====== Response inspection — walks the selected source IN PLACE ======
+  // Source is the live body (fm_http_resp_ptr) or a snapshot slot, chosen by
+  // SELECT. Returns (ptr, len, stale) — `stale` is set when a borrowed (live)
+  // source was selected against an out-of-date generation. Each op records a
+  // result-status in `lastStatus` (read with SCHED_EXT_LAST_STATUS).
+  func inspectBuf() -> (UnsafePointer<UInt8>?, Int, Bool) {
+    if inspectSel == 0 { return (fm_http_resp_ptr(), Int(fm_http_resp_len()), inspectStale) }
+    let s = Int32(inspectSel - 1)
+    return (fm_snapshot_ptr(s), Int(fm_snapshot_len(s)), false)
   }
 
   // 0x16: R[dst] = number at JSON <path> × 10^scale (truncated); R[found] = 0/1.
-  func doJsonNum(_ p: [UInt8], _ plen: Int) {
-    if plen < 6 { return }
-    let dst = Int(p[1] & 0x0F), foundReg = Int(p[2] & 0x0F), scale = Int(p[3])
-    let pathLen = Int(p[4]) | (Int(p[5]) << 7)
-    if 6 + pathLen > plen { return }
-    let path = Array(p[6..<6 + pathLen])
-    let body = responseBody()
-    if let (s, _) = jsonValueSpan(body, path), let v = parseScaledNumber(body, s, scale) {
-      regs[dst] = v; regs[foundReg] = 1
-    } else {
-      regs[dst] = 0; regs[foundReg] = 0
-    }
+  func jsonNumber(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 6 { return }
+    let dst = Int(payload[1] & 0x0F), foundReg = Int(payload[2] & 0x0F), scale = Int(payload[3])
+    let pathLen = Int(payload[4]) | (Int(payload[5]) << 7)
+    if 6 + pathLen > payloadLen { return }
+    let path = Array(payload[6..<6 + pathLen])
+    regs[dst] = 0; regs[foundReg] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard bufLen > 0, let buf = bOpt else { lastStatus = ST_NOT_FOUND; return }
+    guard let (s, _) = jsonValueSpan(buf, bufLen, path) else { lastStatus = ST_NOT_FOUND; return }
+    guard let v = parseScaledNumber(buf, bufLen, s, scale) else { lastStatus = ST_TYPE_MISMATCH; return }
+    regs[dst] = v; regs[foundReg] = 1; lastStatus = ST_OK
   }
 
   // 0x17 (eq) / 0x19 (contains): compare JSON string at <path> with <str>.
-  func doJsonStr(_ p: [UInt8], _ plen: Int, contains: Bool) {
-    if plen < 4 { return }
-    let dst = Int(p[1] & 0x0F)
-    let pathLen = Int(p[2]) | (Int(p[3]) << 7)
+  func jsonString(_ payload: [UInt8], _ payloadLen: Int, contains: Bool) {
+    if payloadLen < 4 { return }
+    let dst = Int(payload[1] & 0x0F)
+    let pathLen = Int(payload[2]) | (Int(payload[3]) << 7)
     var i = 4 + pathLen
-    if i + 2 > plen { return }
-    let path = Array(p[4..<4 + pathLen])
-    let strLen = Int(p[i]) | (Int(p[i + 1]) << 7); i += 2
-    if i + strLen > plen { return }
-    let needle = Array(p[i..<i + strLen])
-    let body = responseBody()
-    var result: Int32 = 0
-    if let (s, e) = jsonValueSpan(body, path), s < e, body[s] == 0x22 {
-      // string value content is between the quotes (escapes left raw)
-      let cs = s + 1, ce = e - 1
-      if ce >= cs {
-        result = (contains ? bytesContain(body, cs, ce, needle)
-                           : bytesEqual(body, cs, ce, needle)) ? 1 : 0
-      }
+    if i + 2 > payloadLen { return }
+    let path = Array(payload[4..<4 + pathLen])
+    let strLen = Int(payload[i]) | (Int(payload[i + 1]) << 7); i += 2
+    if i + strLen > payloadLen { return }
+    let needle = Array(payload[i..<i + strLen])
+    regs[dst] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard bufLen > 0, let buf = bOpt else { lastStatus = ST_NOT_FOUND; return }
+    guard let (s, e) = jsonValueSpan(buf, bufLen, path) else { lastStatus = ST_NOT_FOUND; return }
+    guard s < e, buf[s] == 0x22 else { lastStatus = ST_TYPE_MISMATCH; return }
+    let cs = s + 1, ce = e - 1                   // content between the quotes (escapes raw)
+    if ce >= cs {
+      regs[dst] = (contains ? bytesContain(buf, cs, ce, needle)
+                            : bytesEqual(buf, cs, ce, needle)) ? 1 : 0
     }
-    regs[dst] = result
+    lastStatus = ST_OK
   }
 
   // 0x18: R[dst] = whole body contains <str> ? 1 : 0.
-  func doBodyContains(_ p: [UInt8], _ plen: Int) {
-    if plen < 4 { return }
-    let dst = Int(p[1] & 0x0F)
-    let strLen = Int(p[2]) | (Int(p[3]) << 7)
-    if 4 + strLen > plen { return }
-    let needle = Array(p[4..<4 + strLen])
-    let body = responseBody()
-    regs[dst] = bytesContain(body, 0, body.count, needle) ? 1 : 0
+  func bodyContains(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 4 { return }
+    let dst = Int(payload[1] & 0x0F)
+    let strLen = Int(payload[2]) | (Int(payload[3]) << 7)
+    if 4 + strLen > payloadLen { return }
+    let needle = Array(payload[4..<4 + strLen])
+    regs[dst] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard bufLen > 0, let buf = bOpt else { lastStatus = ST_NOT_FOUND; return }
+    regs[dst] = bytesContain(buf, 0, bufLen, needle) ? 1 : 0; lastStatus = ST_OK
   }
 
-  // ---- minimal JSON walker over a byte buffer (no Foundation) ----
-  private func jsonSkipWs(_ b: [UInt8], _ i: Int) -> Int {
+  // 0x1A: integer arithmetic. R[dst] = A <op> B  (op: 0+ 1- 2* 3/ 4%).
+  // 64-bit intermediates avoid overflow traps; ÷ / % by zero yield 0.
+  func arith(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    let sub = payload[1], dst = Int(payload[2] & 0x0F)
+    var i = 3
+    let a = readOperand(payload, payloadLen, &i).i
+    let b = readOperand(payload, payloadLen, &i).i
+    var r: Int32 = 0
+    switch sub {
+    case 0: r = a &+ b
+    case 1: r = a &- b
+    case 2: r = Int32(truncatingIfNeeded: Int64(a) &* Int64(b))
+    case 3: r = (b != 0) ? Int32(truncatingIfNeeded: Int64(a) / Int64(b)) : 0
+    case 4: r = (b != 0) ? Int32(truncatingIfNeeded: Int64(a) % Int64(b)) : 0
+    default: r = 0
+    }
+    regs[dst] = r
+  }
+
+  // 0x27: comparison. R[dst] = (A <op> B) ? 1 : 0  (op: 0== 1!= 2< 3> 4<= 5>=).
+  // Reuses the same operand decoding + float-promoting compare as SCHED_EXT_IF, so a
+  // task can materialise a reusable boolean register instead of branching inline.
+  func cmp(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    let op = payload[1], dst = Int(payload[2] & 0x0F)
+    var i = 3
+    let a = readOperand(payload, payloadLen, &i)
+    let b = readOperand(payload, payloadLen, &i)
+    regs[dst] = compare(op, a, b) ? 1 : 0
+  }
+
+  // 0x1C: float arithmetic. F[dst] = A <op> B  (op: 0+ 1- 2* 3/). ÷0 → 0.
+  func arithFloat(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    let sub = payload[1], dst = Int(payload[2] & UInt8(NUM_FLOAT_REGS - 1))
+    var i = 3
+    let a = readOperand(payload, payloadLen, &i).f
+    let b = readOperand(payload, payloadLen, &i).f
+    var r: Float = 0
+    switch sub {
+    case 0: r = a + b
+    case 1: r = a - b
+    case 2: r = a * b
+    case 3: r = (b != 0) ? a / b : 0
+    default: r = 0
+    }
+    fregs[dst] = r
+  }
+
+  // 0x1B: F[dst] = float constant (IEEE754 bits in 5 Encoder7Bit bytes).
+  func setFloat(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen != 7 { return }
+    fregs[Int(payload[1] & UInt8(NUM_FLOAT_REGS - 1))] = Float(bitPattern: sched7BitTime(Array(payload[2..<7])))
+  }
+
+  // 0x1D: F[dst] = json float at <path>; R[found] = 0/1.
+  func jsonFloat(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 5 { return }
+    let dst = Int(payload[1] & UInt8(NUM_FLOAT_REGS - 1)), foundReg = Int(payload[2] & 0x0F)
+    let pathLen = Int(payload[3]) | (Int(payload[4]) << 7)
+    if 5 + pathLen > payloadLen { return }
+    let path = Array(payload[5..<5 + pathLen])
+    fregs[dst] = 0; regs[foundReg] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard bufLen > 0, let buf = bOpt else { lastStatus = ST_NOT_FOUND; return }
+    guard let (s, _) = jsonValueSpan(buf, bufLen, path) else { lastStatus = ST_NOT_FOUND; return }
+    guard let v = parseFloat(buf, bufLen, s) else { lastStatus = ST_TYPE_MISMATCH; return }
+    fregs[dst] = v; regs[foundReg] = 1; lastStatus = ST_OK
+  }
+
+  // ---- Query ops: inspect a value's type/size before extracting/storing it ----
+  // Returns the (dst, path) common to the query ops, plus the body span, or nil.
+  private func queryArgs(_ payload: [UInt8], _ payloadLen: Int) -> (Int, UnsafePointer<UInt8>, Int, [UInt8])? {
+    if payloadLen < 4 { return nil }
+    let dst = Int(payload[1] & 0x0F)
+    let pathLen = Int(payload[2]) | (Int(payload[3]) << 7)
+    if 4 + pathLen > payloadLen { return nil }
+    let path = Array(payload[4..<4 + pathLen])
+    regs[dst] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return nil }
+    guard bufLen > 0, let buf = bOpt else { lastStatus = ST_NOT_FOUND; return nil }
+    return (dst, buf, bufLen, path)
+  }
+  // 0x1E: R[dst] = JSON type at path (0 none,1 obj,2 arr,3 str,4 num,5 bool,6 null).
+  func jsonType(_ payload: [UInt8], _ payloadLen: Int) {
+    guard let (dst, buf, bufLen, path) = queryArgs(payload, payloadLen) else { return }
+    guard let (s, e) = jsonValueSpan(buf, bufLen, path), s < e else { lastStatus = ST_NOT_FOUND; return }
+    let c = buf[s]
+    var t: Int32 = 0
+    if c == 0x7B { t = 1 }                                   // {
+    else if c == 0x5B { t = 2 }                              // [
+    else if c == 0x22 { t = 3 }                              // "
+    else if (c >= 48 && c <= 57) || c == 0x2D { t = 4 }      // digit or -
+    else if c == 0x74 || c == 0x66 { t = 5 }                // true/false
+    else if c == 0x6E { t = 6 }                             // null
+    regs[dst] = t; lastStatus = ST_OK
+  }
+  // 0x1F: R[dst] = byte length of the value span at path (for sizing a snapshot).
+  func jsonSize(_ payload: [UInt8], _ payloadLen: Int) {
+    guard let (dst, buf, bufLen, path) = queryArgs(payload, payloadLen) else { return }
+    if let (s, e) = jsonValueSpan(buf, bufLen, path) { regs[dst] = Int32(e - s); lastStatus = ST_OK }
+    else { regs[dst] = 0; lastStatus = ST_NOT_FOUND }
+  }
+  // 0x20: R[dst] = content length of the JSON string at path (0 if not a string).
+  func strLen(_ payload: [UInt8], _ payloadLen: Int) {
+    guard let (dst, buf, bufLen, path) = queryArgs(payload, payloadLen) else { return }
+    guard let (s, e) = jsonValueSpan(buf, bufLen, path) else { regs[dst] = 0; lastStatus = ST_NOT_FOUND; return }
+    if e - s >= 2, buf[s] == 0x22 { regs[dst] = Int32(e - s - 2); lastStatus = ST_OK }   // between quotes
+    else { regs[dst] = 0; lastStatus = ST_TYPE_MISMATCH }
+  }
+  // 0x23: copy the value at <path> from the LIVE body into snapshot slot <slot>.
+  func snapshot(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 4 { return }
+    let slot = Int(payload[1]); if slot < 0 || slot >= NUM_SNAP { return }
+    let pathLen = Int(payload[2]) | (Int(payload[3]) << 7)
+    if 4 + pathLen > payloadLen { return }
+    let path = Array(payload[4..<4 + pathLen])
+    let bufLen = Int(fm_http_resp_len())
+    guard bufLen > 0, let buf = fm_http_resp_ptr() else { lastStatus = ST_NOT_FOUND; return }
+    guard let (s, e) = jsonValueSpan(buf, bufLen, path), e > s else { lastStatus = ST_NOT_FOUND; return }
+    let ok = Int(fm_snapshot_copy(Int32(slot), buf + s, Int32(e - s)))
+    lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
+  }
+  // 0x24: select the inspection source — 0 = live body (stale if requestCount != R[expGenReg]),
+  //       k = snapshot slot k-1 (always valid).
+  func select(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    inspectSel = Int(payload[1])
+    if inspectSel == 0 { inspectStale = (requestCount != regs[Int(payload[2] & 0x0F)]) }
+    else { inspectStale = false }
+  }
+  // 0x25: free snapshot slot <slot>.
+  func free(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 2 { return }
+    let slot = Int(payload[1]); if slot >= 0 && slot < NUM_SNAP { fm_snapshot_free(Int32(slot)) }
+  }
+  // 0x26: R[dst] = status of the last inspection op.
+  func lastStatus(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 2 { return }
+    regs[Int(payload[1] & 0x0F)] = lastStatus
+  }
+  // 0x21: R[freeReg] = free heap, R[largestReg] = largest free block.
+  func heap(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    regs[Int(payload[1] & 0x0F)] = Int32(truncatingIfNeeded: fm_free_heap())
+    regs[Int(payload[2] & 0x0F)] = Int32(truncatingIfNeeded: fm_largest_free_block())
+  }
+
+  // ---- minimal JSON walker over a raw byte buffer (no copy, no Foundation) ----
+  private func jsonSkipWs(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ i: Int) -> Int {
     var j = i
-    while j < b.count, b[j] == 32 || b[j] == 9 || b[j] == 10 || b[j] == 13 { j += 1 }
+    while j < bufLen, buf[j] == 32 || buf[j] == 9 || buf[j] == 10 || buf[j] == 13 { j += 1 }
     return j
   }
-  private func jsonSkipString(_ b: [UInt8], _ i: Int) -> Int {   // i at opening quote
+  private func jsonSkipString(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ i: Int) -> Int {  // i at opening quote
     var j = i + 1
-    while j < b.count {
-      if b[j] == 0x5C { j += 2; continue }   // backslash escape
-      if b[j] == 0x22 { return j + 1 }
+    while j < bufLen {
+      if buf[j] == 0x5C { j += 2; continue }   // backslash escape
+      if buf[j] == 0x22 { return j + 1 }
       j += 1
     }
     return j
   }
-  private func jsonSkipValue(_ b: [UInt8], _ i: Int) -> Int {
-    let j = jsonSkipWs(b, i)
-    if j >= b.count { return j }
-    let c = b[j]
-    if c == 0x22 { return jsonSkipString(b, j) }
+  private func jsonSkipValue(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ i: Int) -> Int {
+    let j = jsonSkipWs(buf, bufLen, i)
+    if j >= bufLen { return j }
+    let c = buf[j]
+    if c == 0x22 { return jsonSkipString(buf, bufLen, j) }
     if c == 0x7B || c == 0x5B {               // { or [
       let open = c, close: UInt8 = (c == 0x7B) ? 0x7D : 0x5D
       var k = j + 1, depth = 1
-      while k < b.count, depth > 0 {
-        let d = b[k]
-        if d == 0x22 { k = jsonSkipString(b, k); continue }
+      while k < bufLen, depth > 0 {
+        let d = buf[k]
+        if d == 0x22 { k = jsonSkipString(buf, bufLen, k); continue }
         if d == open { depth += 1 } else if d == close { depth -= 1 }
         k += 1
       }
       return k
     }
     var k = j                                 // number / true / false / null
-    while k < b.count {
-      let d = b[k]
+    while k < bufLen {
+      let d = buf[k]
       if d == 0x2C || d == 0x7D || d == 0x5D || d == 32 || d == 9 || d == 10 || d == 13 { break }
       k += 1
     }
     return k
   }
-  private func jsonObjectMember(_ b: [UInt8], _ pos: Int, _ key: [UInt8]) -> Int? {
-    var j = jsonSkipWs(b, pos)
-    if j >= b.count || b[j] != 0x7B { return nil }
+  private func jsonObjectMember(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ pos: Int, _ key: [UInt8]) -> Int? {
+    var j = jsonSkipWs(buf, bufLen, pos)
+    if j >= bufLen || buf[j] != 0x7B { return nil }
     j += 1
     while true {
-      j = jsonSkipWs(b, j)
-      if j >= b.count || b[j] == 0x7D { return nil }
-      if b[j] != 0x22 { return nil }
+      j = jsonSkipWs(buf, bufLen, j)
+      if j >= bufLen || buf[j] == 0x7D { return nil }
+      if buf[j] != 0x22 { return nil }
       let ks = j + 1
-      let after = jsonSkipString(b, j); let ke = after - 1
+      let after = jsonSkipString(buf, bufLen, j); let ke = after - 1
       var match = (ke - ks) == key.count
-      if match { for t in 0..<key.count where b[ks + t] != key[t] { match = false; break } }
-      j = jsonSkipWs(b, after)
-      if j >= b.count || b[j] != 0x3A { return nil }       // ':'
-      j = jsonSkipWs(b, j + 1)
+      if match { for t in 0..<key.count where buf[ks + t] != key[t] { match = false; break } }
+      j = jsonSkipWs(buf, bufLen, after)
+      if j >= bufLen || buf[j] != 0x3A { return nil }       // ':'
+      j = jsonSkipWs(buf, bufLen, j + 1)
       if match { return j }
-      j = jsonSkipWs(b, jsonSkipValue(b, j))
-      if j < b.count, b[j] == 0x2C { j += 1; continue }
+      j = jsonSkipWs(buf, bufLen, jsonSkipValue(buf, bufLen, j))
+      if j < bufLen, buf[j] == 0x2C { j += 1; continue }
       return nil
     }
   }
-  private func jsonArrayElement(_ b: [UInt8], _ pos: Int, _ idx: Int) -> Int? {
-    var j = jsonSkipWs(b, pos)
-    if j >= b.count || b[j] != 0x5B { return nil }
+  private func jsonArrayElement(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ pos: Int, _ idx: Int) -> Int? {
+    var j = jsonSkipWs(buf, bufLen, pos)
+    if j >= bufLen || buf[j] != 0x5B { return nil }
     j += 1
     var cur = 0
     while true {
-      j = jsonSkipWs(b, j)
-      if j >= b.count || b[j] == 0x5D { return nil }
+      j = jsonSkipWs(buf, bufLen, j)
+      if j >= bufLen || buf[j] == 0x5D { return nil }
       if cur == idx { return j }
-      j = jsonSkipWs(b, jsonSkipValue(b, j))
-      if j < b.count, b[j] == 0x2C { j += 1; cur += 1; continue }
+      j = jsonSkipWs(buf, bufLen, jsonSkipValue(buf, bufLen, j))
+      if j < bufLen, buf[j] == 0x2C { j += 1; cur += 1; continue }
       return nil
     }
   }
-  // Resolve a dotted/indexed path (e.g. "a.b[0].c") to the value's byte span.
-  func jsonValueSpan(_ b: [UInt8], _ path: [UInt8]) -> (Int, Int)? {
-    if b.isEmpty { return nil }
-    var pos = jsonSkipWs(b, 0)
+  // Resolve a dotted/indexed path (e.g. "a.buf[0].c") to the value's byte span.
+  func jsonValueSpan(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ path: [UInt8]) -> (Int, Int)? {
+    if bufLen == 0 { return nil }
+    var pos = jsonSkipWs(buf, bufLen, 0)
     var pi = 0
     while true {
-      if pi >= path.count { return (pos, jsonSkipValue(b, pos)) }
+      if pi >= path.count { return (pos, jsonSkipValue(buf, bufLen, pos)) }
       if path[pi] == 0x2E { pi += 1; continue }              // '.'
       if path[pi] == 0x5B {                                  // '[' index
         pi += 1; var idx = 0
         while pi < path.count, path[pi] >= 48, path[pi] <= 57 { idx = idx * 10 + Int(path[pi] - 48); pi += 1 }
         if pi < path.count, path[pi] == 0x5D { pi += 1 }
-        guard let p2 = jsonArrayElement(b, pos, idx) else { return nil }
+        guard let p2 = jsonArrayElement(buf, bufLen, pos, idx) else { return nil }
         pos = p2
       } else {                                               // object key
         let ks = pi
         while pi < path.count, path[pi] != 0x2E, path[pi] != 0x5B { pi += 1 }
-        guard let p2 = jsonObjectMember(b, pos, Array(path[ks..<pi])) else { return nil }
+        guard let p2 = jsonObjectMember(buf, bufLen, pos, Array(path[ks..<pi])) else { return nil }
         pos = p2
       }
     }
   }
-  // Parse a JSON number at b[i] into value × 10^scale (truncated). nil if not a number.
-  func parseScaledNumber(_ b: [UInt8], _ i0: Int, _ scale: Int) -> Int32? {
-    var i = jsonSkipWs(b, i0)
-    if i >= b.count { return nil }
+  // Parse a JSON number — or a quoted number string "593.2" — at buf[i0] into
+  // value × 10^scale (truncated). nil if not a number.
+  func parseScaledNumber(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ i0: Int, _ scale: Int) -> Int32? {
+    var i = jsonSkipWs(buf, bufLen, i0)
+    if i < bufLen, buf[i] == 0x22 { i += 1 }                     // tolerate a quoted number
+    if i >= bufLen { return nil }
     var neg = false
-    if b[i] == 0x2D { neg = true; i += 1 }                   // '-'
+    if buf[i] == 0x2D { neg = true; i += 1 }                   // '-'
     var intPart = 0, anyInt = false
-    while i < b.count, b[i] >= 48, b[i] <= 57 { intPart = intPart &* 10 &+ Int(b[i] - 48); anyInt = true; i += 1 }
+    while i < bufLen, buf[i] >= 48, buf[i] <= 57 { intPart = intPart &* 10 &+ Int(buf[i] - 48); anyInt = true; i += 1 }
     if !anyInt { return nil }
     var fracDigits = [UInt8]()
-    if i < b.count, b[i] == 0x2E {                           // '.'
+    if i < bufLen, buf[i] == 0x2E {                              // '.'
       i += 1
-      while i < b.count, b[i] >= 48, b[i] <= 57 { fracDigits.append(b[i] - 48); i += 1 }
+      while i < bufLen, buf[i] >= 48, buf[i] <= 57 { fracDigits.append(buf[i] - 48); i += 1 }
     }
     var v = intPart
     for s in 0..<scale {                                     // shift in `scale` frac digits
@@ -978,18 +1229,51 @@ final class Scheduler {
     }
     return Int32(truncatingIfNeeded: neg ? -v : v)
   }
-  private func bytesEqual(_ b: [UInt8], _ s: Int, _ e: Int, _ needle: [UInt8]) -> Bool {
+  // 10^e as Float, by bounded repeated multiply (no libm dependency).
+  private func pow10f(_ e: Int) -> Float {
+    var r: Float = 1, n = e
+    if n >= 0 { while n > 0 { r *= 10; n -= 1 } } else { while n < 0 { r /= 10; n += 1 } }
+    return r
+  }
+  // Parse a JSON number — or quoted "593.2", with optional exponent — into a Float.
+  func parseFloat(_ buf: UnsafePointer<UInt8>, _ bufLen: Int, _ i0: Int) -> Float? {
+    var i = jsonSkipWs(buf, bufLen, i0)
+    if i < bufLen, buf[i] == 0x22 { i += 1 }                     // tolerate a quoted number
+    if i >= bufLen { return nil }
+    var neg = false
+    if buf[i] == 0x2D { neg = true; i += 1 }
+    var v: Float = 0, anyInt = false
+    while i < bufLen, buf[i] >= 48, buf[i] <= 57 { v = v * 10 + Float(buf[i] - 48); anyInt = true; i += 1 }
+    if !anyInt { return nil }
+    if i < bufLen, buf[i] == 0x2E {                              // fractional part
+      i += 1
+      var scale: Float = 1
+      while i < bufLen, buf[i] >= 48, buf[i] <= 57 { v = v * 10 + Float(buf[i] - 48); scale *= 10; i += 1 }
+      v /= scale
+    }
+    if neg { v = -v }
+    if i < bufLen, (buf[i] == 0x65 || buf[i] == 0x45) {           // exponent e/E
+      i += 1
+      var eneg = false
+      if i < bufLen, (buf[i] == 0x2B || buf[i] == 0x2D) { eneg = (buf[i] == 0x2D); i += 1 }
+      var e = 0
+      while i < bufLen, buf[i] >= 48, buf[i] <= 57 { e = e * 10 + Int(buf[i] - 48); i += 1 }
+      v *= pow10f(eneg ? -e : e)
+    }
+    return v
+  }
+  private func bytesEqual(_ buf: UnsafePointer<UInt8>, _ s: Int, _ e: Int, _ needle: [UInt8]) -> Bool {
     if e - s != needle.count { return false }
-    for t in 0..<needle.count where b[s + t] != needle[t] { return false }
+    for t in 0..<needle.count where buf[s + t] != needle[t] { return false }
     return true
   }
-  private func bytesContain(_ b: [UInt8], _ s: Int, _ e: Int, _ needle: [UInt8]) -> Bool {
+  private func bytesContain(_ buf: UnsafePointer<UInt8>, _ s: Int, _ e: Int, _ needle: [UInt8]) -> Bool {
     if needle.isEmpty { return true }
     if e - s < needle.count { return false }
     var i = s
     while i <= e - needle.count {
       var m = true
-      for t in 0..<needle.count where b[i + t] != needle[t] { m = false; break }
+      for t in 0..<needle.count where buf[i + t] != needle[t] { m = false; break }
       if m { return true }
       i += 1
     }
@@ -1020,29 +1304,29 @@ final class Scheduler {
     sendFrame(out, n)
   }
 
-  func handleSysex(_ payload: [UInt8], _ plen: Int) {
-    if plen < 1 { return }
+  func handleSysex(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 1 { return }
     switch payload[0] {
     case SCHED_CREATE:
-      if plen == 4 { create(payload[1], UInt16(payload[2]) | (UInt16(payload[3]) << 7)) }
+      if payloadLen == 4 { create(payload[1], UInt16(payload[2]) | (UInt16(payload[3]) << 7)) }
     case SCHED_DELETE:
-      if plen == 2 { delete(payload[1]) }
+      if payloadLen == 2 { delete(payload[1]) }
     case SCHED_ADD:
-      if plen > 2 {
-        var outLen = sched7BitOutBytes(plen - 2)
+      if payloadLen > 2 {
+        var outLen = sched7BitOutBytes(payloadLen - 2)
         if outLen > MAX_TASK_BYTES { outLen = MAX_TASK_BYTES }
         var dec = [UInt8](repeating: 0, count: MAX_TASK_BYTES)
-        sched7BitDecode(outLen, Array(payload[2..<plen]), &dec)
+        sched7BitDecode(outLen, Array(payload[2..<payloadLen]), &dec)
         add(payload[1], dec, outLen)
       }
     case SCHED_DELAY:
-      if plen == 6 { delayRunning(sched7BitTime(Array(payload[1..<6]))) }
+      if payloadLen == 6 { delayRunning(sched7BitTime(Array(payload[1..<6]))) }
     case SCHED_SCHEDULE:
-      if plen == 7 { schedule(payload[1], sched7BitTime(Array(payload[2..<7]))) }
+      if payloadLen == 7 { schedule(payload[1], sched7BitTime(Array(payload[2..<7]))) }
     case SCHED_EXT_COMMAND:             // 0x7F: logic ops live under the reserved ext cmd
-      if plen >= 2 { handleExt(Array(payload[1..<plen]), plen - 1) }
+      if payloadLen >= 2 { handleExt(Array(payload[1..<payloadLen]), payloadLen - 1) }
     case SCHED_QUERY_ALL: queryAll()
-    case SCHED_QUERY:     if plen == 2 { queryTask(payload[1]) }
+    case SCHED_QUERY:     if payloadLen == 2 { queryTask(payload[1]) }
     case SCHED_RESET:     reset()
     default: break
     }
@@ -1105,7 +1389,7 @@ func sampleAnalogAndI2C() {
     if pin >= 0 { sendAnalogReport(ch, Int(analogRead(UInt8(pin)))) }
   }
   for i in 0..<MAX_CONT_READS where contReads[i].active {
-    i2cDoRead(contReads[i].address, contReads[i].reg, contReads[i].count)
+      i2cRead(contReads[i].address, contReads[i].reg, contReads[i].count)
   }
 }
 

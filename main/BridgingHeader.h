@@ -42,7 +42,14 @@ void fm_mdns_add_txt(const uint8_t *svc, const uint8_t *proto, const uint8_t *k,
 // --- HTTP client (over Wi-Fi) ---
 int fm_http_request(const uint8_t *url, int is_post, const uint8_t *body, const uint8_t *content_type);
 int fm_http_resp_len(void);
+const uint8_t *fm_http_resp_ptr(void);
 int fm_http_resp_copy(uint8_t *dst, int max);
+int fm_free_heap(void);
+int fm_largest_free_block(void);
+int fm_snapshot_copy(int slot, const uint8_t *src, int len);
+const uint8_t *fm_snapshot_ptr(int slot);
+int fm_snapshot_len(int slot);
+void fm_snapshot_free(int slot);
 
 // --- TCP server / client ---
 void fm_tcp_begin(int port);
