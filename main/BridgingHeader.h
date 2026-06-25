@@ -34,6 +34,7 @@ int  fm_i2c_read(void);
 // --- Wi-Fi / mDNS ---
 void fm_wifi_begin(const uint8_t *ssid, const uint8_t *pass, const uint8_t *host);
 int  fm_wifi_connected(void);
+int  fm_wifi_same_network(const uint8_t *ssid, const uint8_t *pass);
 int  fm_wifi_localip(uint8_t *out, int n);
 int  fm_mdns_begin(const uint8_t *host);
 void fm_mdns_add_service(const uint8_t *svc, const uint8_t *proto, int port);
@@ -60,6 +61,15 @@ int  fm_tcp_available(void);
 int  fm_tcp_read(void);
 void fm_tcp_write(const uint8_t *buf, int len);
 void fm_tcp_drop(void);
+
+// --- Encrypted Wi-Fi provisioning (X25519 ECDH + HKDF-SHA256 + AES-256-GCM, NVS) ---
+int  fm_wc_begin(uint8_t *out_pub32);                                   // 1 ok / 0 fail
+int  fm_wc_derive_key(const uint8_t *peer_pub32, uint8_t *out_key32);   // one-shot
+int  fm_wc_gcm_decrypt(const uint8_t *key32, const uint8_t *nonce12,
+                       const uint8_t *ct, int ctlen, const uint8_t *tag16, uint8_t *out_pt);
+int  fm_nvs_load_creds(uint8_t *ssid, int ssid_cap, uint8_t *pass, int pass_cap);
+void fm_nvs_save_creds(const uint8_t *ssid, const uint8_t *pass);
+void fm_nvs_clear_creds(void);
 
 // --- BLE Nordic UART Service ---
 void fm_ble_begin(const uint8_t *name);

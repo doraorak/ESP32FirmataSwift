@@ -52,6 +52,15 @@ let REPORT_FIRMWARE: UInt8         = 0x79
 let SAMPLING_INTERVAL: UInt8       = 0x7A
 let SCHEDULER_DATA: UInt8          = 0x7B
 
+// Encrypted Wi-Fi provisioning (non-standard; top-level user-range SysEx 0x0C).
+let WIFI_CONFIG: UInt8 = 0x0C
+let WC_SET:    UInt8 = 0x00   // host->dev: <clientPub><nonce><ciphertext+tag>
+let WC_FORGET: UInt8 = 0x01   // host->dev: clear stored creds
+let WC_QUERY:  UInt8 = 0x02   // host->dev: request status
+let WC_BEGIN:  UInt8 = 0x03   // host->dev: start handshake
+let WC_KEY:    UInt8 = 0x7E   // dev->host: <devicePub> (32 bytes)
+let WC_STATUS: UInt8 = 0x7F   // dev->host: <code> <ipLen> <ip>  (0 down, 1 connected, 2 rejected)
+
 // Scheduler sub-commands
 let SCHED_CREATE: UInt8          = 0x00
 let SCHED_DELETE: UInt8          = 0x01
@@ -526,6 +535,7 @@ final class FirmataProtocol {
     case I2C_CONFIG:           handleI2CConfig(data, dlen)
     case I2C_REQUEST:          handleI2CRequest(data, dlen)
     case SCHEDULER_DATA:       sched.handleSysex(data, dlen)
+    case WIFI_CONFIG:          handleWiFiConfig(data, dlen)
     default:                   break
     }
   }
@@ -1475,6 +1485,51 @@ let TCP_PORT: Int32 = 3030
 
 var wifiReady = false
 
+// Active Wi-Fi creds (null-terminated C strings): NVS-provisioned creds override
+// the compile-time WIFI_SSID/WIFI_PASS. Loaded once before the first connect.
+var gSsid = [UInt8](repeating: 0, count: 64)
+var gPass = [UInt8](repeating: 0, count: 64)
+
+@inline(__always) func copyStatic(_ s: StaticString, into buf: inout [UInt8]) {
+  s.withUTF8Buffer { src in
+    let n = min(src.count, buf.count - 1)
+    for i in 0..<n { buf[i] = src[i] }
+    buf[n] = 0
+  }
+}
+
+func loadWifiCreds() {
+  let found = gSsid.withUnsafeMutableBufferPointer { sp in
+    gPass.withUnsafeMutableBufferPointer { pp in
+      fm_nvs_load_creds(sp.baseAddress, 64, pp.baseAddress, 64)
+    }
+  }
+  if found == 0 {                       // nothing provisioned → compile-time defaults
+    copyStatic(WIFI_SSID, into: &gSsid)
+    copyStatic(WIFI_PASS, into: &gPass)
+  }
+}
+
+// (Re)connect Wi-Fi with the active creds; restart Bonjour/TCP on success.
+func applyActiveCreds() -> Bool {
+  // Already on the target network? Don't tear down a working link (also lets a
+  // re-provision over TCP reply before the socket would drop).
+  let same = gSsid.withUnsafeBufferPointer { sp in
+    gPass.withUnsafeBufferPointer { pp in fm_wifi_same_network(sp.baseAddress, pp.baseAddress) }
+  }
+  if same != 0 { if !wifiReady { startTcpServices() }; return true }
+  wifiReady = false
+  gSsid.withUnsafeBufferPointer { sp in
+    gPass.withUnsafeBufferPointer { pp in
+      fm_wifi_begin(sp.baseAddress, pp.baseAddress, cs(MDNS_HOST))
+    }
+  }
+  var tries = 0
+  while fm_wifi_connected() == 0 && tries < 30 { fm_delay_ms(400); tries += 1 }
+  if fm_wifi_connected() != 0 { startTcpServices(); return true }
+  return false
+}
+
 // ===========================================================================
 //  Transport — Wi-Fi / Bonjour (orchestration in Swift; vendor calls bridged)
 // ===========================================================================
@@ -1502,12 +1557,90 @@ func startTcpServices() {
 }
 
 func wifiStart() {
-  fm_wifi_begin(cs(WIFI_SSID), cs(WIFI_PASS), cs(MDNS_HOST))
+  loadWifiCreds()                       // NVS-provisioned creds override compile-time
   fm_log(cs("Connecting to Wi-Fi..."))
-  var tries = 0
-  while fm_wifi_connected() == 0 && tries < 40 { fm_delay_ms(400); tries += 1 }
-  if fm_wifi_connected() != 0 { startTcpServices() }
-  else { fm_log(cs("Wi-Fi not up yet; BLE still available.")) }
+  if !applyActiveCreds() { fm_log(cs("Wi-Fi not up yet; BLE still available.")) }
+}
+
+// ---- Encrypted Wi-Fi provisioning handler (WIFI_CONFIG SysEx 0x0C) ----------
+func wcSendKey(_ pub: [UInt8]) {
+  var out: [UInt8] = [START_SYSEX, WIFI_CONFIG, WC_KEY]
+  for b in pub { out.append(b & 0x7F); out.append((b >> 7) & 0x01) }
+  out.append(END_SYSEX)
+  sendFrame(out, out.count)
+}
+
+// code: 0 = Wi-Fi down, 1 = connected, 2 = creds rejected (decrypt/auth failed).
+func wcSendStatus(_ code: UInt8) {
+  var out: [UInt8] = [START_SYSEX, WIFI_CONFIG, WC_STATUS, code]
+  var ipbuf = [UInt8](repeating: 0, count: 24)
+  let iplen = ipbuf.withUnsafeMutableBufferPointer { fm_wifi_localip($0.baseAddress, 24) }
+  let n = (fm_wifi_connected() != 0) ? min(Int(iplen), 23) : 0
+  out.append(UInt8(n & 0x7F))
+  for i in 0..<n { out.append(ipbuf[i] & 0x7F); out.append((ipbuf[i] >> 7) & 0x01) }
+  out.append(END_SYSEX)
+  sendFrame(out, out.count)
+}
+
+func handleWiFiConfig(_ data: [UInt8], _ dlen: Int) {
+  if dlen < 1 { return }
+  switch data[0] {
+  case WC_BEGIN:
+    var pub = [UInt8](repeating: 0, count: 32)
+    let ok = pub.withUnsafeMutableBufferPointer { fm_wc_begin($0.baseAddress) }
+    if ok != 0 { wcSendKey(pub) }
+  case WC_QUERY:
+    wcSendStatus(fm_wifi_connected() != 0 ? 1 : 0)
+  case WC_FORGET:
+    fm_nvs_clear_creds()
+    copyStatic(WIFI_SSID, into: &gSsid); copyStatic(WIFI_PASS, into: &gPass)
+    wcSendStatus(fm_wifi_connected() != 0 ? 1 : 0)
+  case WC_SET:
+    // decode 14-bit LSB/MSB pairs -> raw: clientPub(32) nonce(12) ciphertext+tag
+    var raw = [UInt8](); raw.reserveCapacity((dlen - 1) / 2)
+    var i = 1
+    while i + 1 < dlen { raw.append((data[i] & 0x7F) | ((data[i + 1] & 0x01) << 7)); i += 2 }
+    if raw.count < 32 + 12 + 16 { wcSendStatus(2); return }
+    let ctLen = raw.count - 44 - 16
+    if ctLen <= 0 || ctLen > 240 { wcSendStatus(2); return }
+    var key = [UInt8](repeating: 0, count: 32)
+    let derived = raw.withUnsafeBufferPointer { rp in
+      key.withUnsafeMutableBufferPointer { kp in fm_wc_derive_key(rp.baseAddress, kp.baseAddress) }
+    }
+    if derived == 0 { wcSendStatus(2); return }
+    var pt = [UInt8](repeating: 0, count: 256)
+    let dec = raw.withUnsafeBufferPointer { rp -> Int32 in
+      key.withUnsafeBufferPointer { kp in
+        pt.withUnsafeMutableBufferPointer { pp in
+          let rb = rp.baseAddress!
+          return fm_wc_gcm_decrypt(kp.baseAddress, rb + 32, rb + 44, Int32(ctLen),
+                                   rb + 44 + ctLen, pp.baseAddress)
+        }
+      }
+    }
+    if dec == 0 { wcSendStatus(2); return }
+    // plaintext: <ssidLen> ssid <passLen> pass  (bounded to the 64-byte buffers)
+    var ok = false
+    if ctLen >= 1 {
+      let sl = Int(pt[0])
+      if sl > 0 && sl <= 63 && 1 + sl < ctLen {
+        for k in 0..<sl { gSsid[k] = pt[1 + k] }; gSsid[sl] = 0
+        let pl = Int(pt[1 + sl])
+        if pl <= 63 && 2 + sl + pl <= ctLen {
+          for k in 0..<pl { gPass[k] = pt[2 + sl + k] }; gPass[pl] = 0
+          ok = true
+        }
+      }
+    }
+    if ok {
+      gSsid.withUnsafeBufferPointer { sp in
+        gPass.withUnsafeBufferPointer { pp in fm_nvs_save_creds(sp.baseAddress, pp.baseAddress) }
+      }
+      _ = applyActiveCreds()
+    }
+    wcSendStatus(fm_wifi_connected() != 0 ? 1 : 0)
+  default: break
+  }
 }
 
 func tcpPoll() {
