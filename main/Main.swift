@@ -1620,7 +1620,9 @@ func handleWiFiConfig(_ data: [UInt8], _ dlen: Int) {
     }
     if dec == 0 { wcSendStatus(2); return }
     // plaintext: <ssidLen> ssid <passLen> pass  (bounded to the 64-byte buffers)
-    var ok = false
+    let prevSsid = gSsid, prevPass = gPass            // for rollback if the new creds fail
+    let wasConnected = fm_wifi_connected() != 0
+    var parsed = false
     if ctLen >= 1 {
       let sl = Int(pt[0])
       if sl > 0 && sl <= 63 && 1 + sl < ctLen {
@@ -1628,17 +1630,24 @@ func handleWiFiConfig(_ data: [UInt8], _ dlen: Int) {
         let pl = Int(pt[1 + sl])
         if pl <= 63 && 2 + sl + pl <= ctLen {
           for k in 0..<pl { gPass[k] = pt[2 + sl + k] }; gPass[pl] = 0
-          ok = true
+          parsed = true
         }
       }
     }
-    if ok {
+    if !parsed {                                       // malformed -> undo any partial write
+      gSsid = prevSsid; gPass = prevPass
+      wcSendStatus(fm_wifi_connected() != 0 ? 1 : 0); return
+    }
+    if applyActiveCreds() {                            // new creds joined -> persist them
       gSsid.withUnsafeBufferPointer { sp in
         gPass.withUnsafeBufferPointer { pp in fm_nvs_save_creds(sp.baseAddress, pp.baseAddress) }
       }
-      _ = applyActiveCreds()
+      wcSendStatus(1)
+    } else {                                           // failed -> revert, leave NVS untouched
+      gSsid = prevSsid; gPass = prevPass
+      if wasConnected { _ = applyActiveCreds() }
+      wcSendStatus(0)
     }
-    wcSendStatus(fm_wifi_connected() != 0 ? 1 : 0)
   default: break
   }
 }

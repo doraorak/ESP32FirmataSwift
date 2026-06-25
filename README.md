@@ -48,8 +48,10 @@ print(status.connected, status.ip ?? "—")               // e.g. true 192.168.1
 The handshake is **encrypted** — an ephemeral X25519 ECDH → HKDF-SHA256 → AES-256-GCM, so
 a passive sniffer never sees the password (no BLE pairing required). Provisioned creds are
 saved on the device (NVS) and **override** the compile-time defaults on every boot; clear
-them with `client.forgetWiFi()`. (No pairing ⇒ not hardened against an active real-time
-MITM during the handshake — fine for the typical at-your-bench setup.)
+them with `client.forgetWiFi()`. If the new credentials don't actually connect, the device
+**rolls back** to its previous network and doesn't store them — a wrong password can't
+strand the board. (No pairing ⇒ not hardened against an active real-time MITM during the
+handshake — fine for the typical at-your-bench setup.)
 
 The Firmata protocol, the Scheduler, and the on-device register / `if` / `else`
 logic extension are all written in Embedded Swift; the Arduino peripheral APIs
