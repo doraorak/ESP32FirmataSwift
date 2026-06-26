@@ -102,6 +102,11 @@ let SCHED_EXT_SELECT: UInt8       = 0x24   // pick the inspection source (0=live
 let SCHED_EXT_FREE: UInt8         = 0x25   // free a snapshot slot
 let SCHED_EXT_LAST_STATUS: UInt8  = 0x26   // R[dst] = status of the last inspection op
 let SCHED_EXT_CMP: UInt8          = 0x27   // R[dst] = (A <op> B) ? 1 : 0  (op: 0== 1!= 2< 3> 4<= 5>=)
+// Raw-string ops over the selected body (board.string). `contains` reuses BODY_CONTAINS (0x18).
+let SCHED_EXT_STR_BODY_LEN: UInt8 = 0x28  // R[dst] = byte length of the selected body
+let SCHED_EXT_STR_EQUALS: UInt8   = 0x29  // R[dst] = (selected body == <str>) ? 1 : 0
+let SCHED_EXT_STR_INDEXOF: UInt8  = 0x2A  // R[dst] = index of <str> in body, or -1
+let SCHED_EXT_STR_TO_NUM: UInt8   = 0x2B  // R[dst] = body parsed as int; R[found] = 0/1
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -859,6 +864,14 @@ final class Scheduler {
       lastStatus(payload, payloadLen)
     case SCHED_EXT_CMP:                // 0x27 op dst <operandA> <operandB>
       cmp(payload, payloadLen)
+    case SCHED_EXT_STR_BODY_LEN:      // 0x28 dst
+      strBodyLen(payload, payloadLen)
+    case SCHED_EXT_STR_EQUALS:        // 0x29 dst strLo strHi str…
+      strEquals(payload, payloadLen)
+    case SCHED_EXT_STR_INDEXOF:       // 0x2A dst strLo strHi str…
+      strIndexOf(payload, payloadLen)
+    case SCHED_EXT_STR_TO_NUM:        // 0x2B dst found
+      strToNum(payload, payloadLen)
     default:
       break
     }
@@ -968,6 +981,84 @@ final class Scheduler {
     if stale { lastStatus = ST_STALE; return }
     guard bufLen > 0, let buf = bOpt else { lastStatus = ST_NOT_FOUND; return }
     regs[dst] = bytesContain(buf, 0, bufLen, needle) ? 1 : 0; lastStatus = ST_OK
+  }
+
+  // 0x28: R[dst] = byte length of the selected body (raw string).
+  func strBodyLen(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 2 { return }
+    let dst = Int(payload[1] & 0x0F)
+    regs[dst] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard bOpt != nil else { lastStatus = ST_NOT_FOUND; return }
+    regs[dst] = Int32(bufLen); lastStatus = ST_OK
+  }
+
+  // 0x29: R[dst] = (selected body == <str>) ? 1 : 0.
+  func strEquals(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 4 { return }
+    let dst = Int(payload[1] & 0x0F)
+    let sLen = Int(payload[2]) | (Int(payload[3]) << 7)
+    if 4 + sLen > payloadLen { return }
+    regs[dst] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard let buf = bOpt else { lastStatus = ST_NOT_FOUND; return }
+    if bufLen == sLen {
+      var eq = true
+      for k in 0..<sLen where buf[k] != payload[4 + k] { eq = false; break }
+      regs[dst] = eq ? 1 : 0
+    }
+    lastStatus = ST_OK
+  }
+
+  // 0x2A: R[dst] = index of <str> in the selected body, or -1.
+  func strIndexOf(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 4 { return }
+    let dst = Int(payload[1] & 0x0F)
+    let sLen = Int(payload[2]) | (Int(payload[3]) << 7)
+    if 4 + sLen > payloadLen { return }
+    regs[dst] = -1
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard let buf = bOpt else { lastStatus = ST_NOT_FOUND; return }
+    let needle = Array(payload[4..<4 + sLen])
+    if needle.isEmpty { regs[dst] = 0; lastStatus = ST_OK; return }
+    if bufLen >= needle.count {
+      var i = 0
+      while i <= bufLen - needle.count {
+        var m = true
+        for t in 0..<needle.count where buf[i + t] != needle[t] { m = false; break }
+        if m { regs[dst] = Int32(i); break }
+        i += 1
+      }
+    }
+    lastStatus = ST_OK
+  }
+
+  // 0x2B: R[dst] = body parsed as a leading integer; R[found] = 0/1.
+  func strToNum(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    let dst = Int(payload[1] & 0x0F), foundReg = Int(payload[2] & 0x0F)
+    regs[dst] = 0; regs[foundReg] = 0
+    let (bOpt, bufLen, stale) = inspectBuf()
+    if stale { lastStatus = ST_STALE; return }
+    guard let buf = bOpt, bufLen > 0 else { lastStatus = ST_NOT_FOUND; return }
+    var i = 0
+    while i < bufLen, buf[i] == 0x20 || buf[i] == 0x09 { i += 1 }   // skip leading whitespace
+    var negative = false
+    if i < bufLen, buf[i] == 0x2D { negative = true; i += 1 }
+    else if i < bufLen, buf[i] == 0x2B { i += 1 }
+    var val: Int32 = 0; var any = false
+    while i < bufLen, buf[i] >= 0x30, buf[i] <= 0x39 {
+      any = true
+      if val > 214748364 { val = 2147483647 }                       // clamp (wrapping ops, no checked mul)
+      else { val = val &* 10 &+ Int32(buf[i] - 0x30) }
+      i += 1
+    }
+    if any {
+      regs[dst] = negative ? (0 &- val) : val; regs[foundReg] = 1; lastStatus = ST_OK
+    } else { lastStatus = ST_TYPE_MISMATCH }
   }
 
   // 0x1A: integer arithmetic. R[dst] = A <op> B  (op: 0+ 1- 2* 3/ 4%).
