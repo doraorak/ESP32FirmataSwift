@@ -107,6 +107,7 @@ let SCHED_EXT_STR_BODY_LEN: UInt8 = 0x28  // R[dst] = byte length of the selecte
 let SCHED_EXT_STR_EQUALS: UInt8   = 0x29  // R[dst] = (selected body == <str>) ? 1 : 0
 let SCHED_EXT_STR_INDEXOF: UInt8  = 0x2A  // R[dst] = index of <str> in body, or -1
 let SCHED_EXT_STR_TO_NUM: UInt8   = 0x2B  // R[dst] = body parsed as int; R[found] = 0/1
+let SCHED_EXT_JSON_GET_STRING: UInt8 = 0x2C  // copy a JSON string's content at path into a snapshot slot
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -872,6 +873,8 @@ final class Scheduler {
       strIndexOf(payload, payloadLen)
     case SCHED_EXT_STR_TO_NUM:        // 0x2B dst found
       strToNum(payload, payloadLen)
+    case SCHED_EXT_JSON_GET_STRING:   // 0x2C slot pathLo pathHi path…
+      jsonGetString(payload, payloadLen)
     default:
       break
     }
@@ -1185,6 +1188,21 @@ final class Scheduler {
     guard bufLen > 0, let buf = fm_http_resp_ptr() else { lastStatus = ST_NOT_FOUND; return }
     guard let (s, e) = jsonValueSpan(buf, bufLen, path), e > s else { lastStatus = ST_NOT_FOUND; return }
     let ok = Int(fm_snapshot_copy(Int32(slot), buf + s, Int32(e - s)))
+    lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
+  }
+  // 0x2C: copy the CONTENT (unquoted) of the JSON string at <path> from the LIVE body into
+  //       snapshot slot <slot>. Backs board.json.getString → a StringHandle for board.string.
+  func jsonGetString(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 4 { return }
+    let slot = Int(payload[1]); if slot < 0 || slot >= NUM_SNAP { return }
+    let pathLen = Int(payload[2]) | (Int(payload[3]) << 7)
+    if 4 + pathLen > payloadLen { return }
+    let path = Array(payload[4..<4 + pathLen])
+    let bufLen = Int(fm_http_resp_len())
+    guard bufLen > 0, let buf = fm_http_resp_ptr() else { lastStatus = ST_NOT_FOUND; return }
+    guard let (s, e) = jsonValueSpan(buf, bufLen, path), e > s else { lastStatus = ST_NOT_FOUND; return }
+    guard buf[s] == 0x22, e - 1 > s else { lastStatus = ST_TYPE_MISMATCH; return }   // must be a JSON string
+    let ok = Int(fm_snapshot_copy(Int32(slot), buf + s + 1, Int32((e - 1) - (s + 1))))
     lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
   }
   // 0x24: select the inspection source — 0 = live body (stale if requestCount != R[expGenReg]),

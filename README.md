@@ -272,10 +272,12 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                 F7  //
 * `CMP` (`0x27`): `R[dst]` = `(A <op> B) ? 1 : 0` using the same `<op>` codes and
   operand decoding as `IF` (floats promote). Materialises a reusable boolean register
   instead of branching inline — the host's `isValid()` uses it against `BODY_GEN`.
-* Raw-string ops (`board.string`, over the **selected** body): `STR_BODY_LEN` (`0x28`)
-  → byte length; `STR_EQUALS` (`0x29`) → whole body == `<str>` ? 1 : 0; `STR_INDEXOF`
-  (`0x2A`) → index of `<str>`, or `-1`; `STR_TO_NUM` (`0x2B`) → leading integer into
-  `R[dst]`, `R[found]`=`1`/`0`. (`contains` reuses `BODY_CONTAINS` `0x18`.)
+* `JSON_GET_STRING` (`0x2C`): copy the **content** (unquoted) of the JSON string at `<path>`
+  from the live body into a snapshot slot — backs `board.json.getString` → a `StringHandle`.
+* Raw-string ops on a selected string (`board.string`): `STR_BODY_LEN` (`0x28`) → byte
+  length; `STR_EQUALS` (`0x29`) → `== <str>` ? 1 : 0; `STR_INDEXOF` (`0x2A`) → index of
+  `<str>`, or `-1`; `STR_TO_NUM` (`0x2B`) → leading integer into `R[dst]`, `R[found]`=`1`/`0`.
+  (`contains` reuses `BODY_CONTAINS` `0x18`.)
 * Floats: 8 registers `F0`–`F7`. `SET_FLOAT` (`0x1B`) loads a literal; `ARITH_F`
   (`0x1C`, subops `0`=+ `1`=− `2`=× `3`=÷, `÷0`→0) does float math; `JSON_FLOAT`
   (`0x1D`) reads a JSON number (quoted, fractional, or exponent) into `F[fdst]`,
