@@ -109,6 +109,7 @@ let SCHED_EXT_STR_INDEXOF: UInt8  = 0x2A  // R[dst] = index of <str> in body, or
 let SCHED_EXT_STR_TO_NUM: UInt8   = 0x2B  // R[dst] = body parsed as int; R[found] = 0/1
 let SCHED_EXT_JSON_GET_STRING: UInt8 = 0x2C  // copy a JSON string's content at path into a snapshot slot
 let SCHED_EXT_STR_SET_SLOT: UInt8 = 0x2D  // set a snapshot slot's content to a literal string
+let SCHED_EXT_STR_COPY_SLOT: UInt8 = 0x2E  // copy one snapshot slot's content into another
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -117,7 +118,7 @@ let ST_STALE: Int32         = 2
 let ST_TYPE_MISMATCH: Int32 = 3
 let ST_TOO_BIG: Int32       = 4
 let ST_ALLOC_FAILED: Int32  = 5
-let NUM_SNAP = 5
+let NUM_SNAP = 12   // 2 JSON snapshot slots (0–1) + 10 string slots (2–11)
 
 // Pin modes
 let PIN_MODE_INPUT: UInt8  = 0x00
@@ -878,6 +879,8 @@ final class Scheduler {
       jsonGetString(payload, payloadLen)
     case SCHED_EXT_STR_SET_SLOT:      // 0x2D slot strLo strHi str…
       strSetSlot(payload, payloadLen)
+    case SCHED_EXT_STR_COPY_SLOT:     // 0x2E dst src
+      strCopySlot(payload, payloadLen)
     default:
       break
     }
@@ -1218,6 +1221,16 @@ final class Scheduler {
     let ok = payload.withUnsafeBufferPointer { p in
       Int(fm_snapshot_copy(Int32(slot), p.baseAddress! + 4, Int32(sLen)))
     }
+    lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
+  }
+  // 0x2E: copy snapshot slot <src> content into slot <dst> (backs string changeSlot / snapshotString).
+  func strCopySlot(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    let dst = Int(payload[1]); let src = Int(payload[2])
+    if dst < 0 || dst >= NUM_SNAP || src < 0 || src >= NUM_SNAP { return }
+    let sl = Int(fm_snapshot_len(Int32(src)))
+    guard let sp = fm_snapshot_ptr(Int32(src)) else { lastStatus = ST_NOT_FOUND; return }
+    let ok = Int(fm_snapshot_copy(Int32(dst), sp, Int32(sl)))
     lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
   }
   // 0x24: select the inspection source — 0 = live body (stale if requestCount != R[expGenReg]),
