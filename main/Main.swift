@@ -108,6 +108,7 @@ let SCHED_EXT_STR_EQUALS: UInt8   = 0x29  // R[dst] = (selected body == <str>) ?
 let SCHED_EXT_STR_INDEXOF: UInt8  = 0x2A  // R[dst] = index of <str> in body, or -1
 let SCHED_EXT_STR_TO_NUM: UInt8   = 0x2B  // R[dst] = body parsed as int; R[found] = 0/1
 let SCHED_EXT_JSON_GET_STRING: UInt8 = 0x2C  // copy a JSON string's content at path into a snapshot slot
+let SCHED_EXT_STR_SET_SLOT: UInt8 = 0x2D  // set a snapshot slot's content to a literal string
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -116,7 +117,7 @@ let ST_STALE: Int32         = 2
 let ST_TYPE_MISMATCH: Int32 = 3
 let ST_TOO_BIG: Int32       = 4
 let ST_ALLOC_FAILED: Int32  = 5
-let NUM_SNAP = 2
+let NUM_SNAP = 5
 
 // Pin modes
 let PIN_MODE_INPUT: UInt8  = 0x00
@@ -875,6 +876,8 @@ final class Scheduler {
       strToNum(payload, payloadLen)
     case SCHED_EXT_JSON_GET_STRING:   // 0x2C slot pathLo pathHi path…
       jsonGetString(payload, payloadLen)
+    case SCHED_EXT_STR_SET_SLOT:      // 0x2D slot strLo strHi str…
+      strSetSlot(payload, payloadLen)
     default:
       break
     }
@@ -1203,6 +1206,18 @@ final class Scheduler {
     guard let (s, e) = jsonValueSpan(buf, bufLen, path), e > s else { lastStatus = ST_NOT_FOUND; return }
     guard buf[s] == 0x22, e - 1 > s else { lastStatus = ST_TYPE_MISMATCH; return }   // must be a JSON string
     let ok = Int(fm_snapshot_copy(Int32(slot), buf + s + 1, Int32((e - 1) - (s + 1))))
+    lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
+  }
+  // 0x2D: set snapshot slot <slot> to the literal string in the payload — backs the
+  //       standalone StringHandle initialiser (board.string ops then run on the slot).
+  func strSetSlot(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 4 { return }
+    let slot = Int(payload[1]); if slot < 0 || slot >= NUM_SNAP { return }
+    let sLen = Int(payload[2]) | (Int(payload[3]) << 7)
+    if 4 + sLen > payloadLen { return }
+    let ok = payload.withUnsafeBufferPointer { p in
+      Int(fm_snapshot_copy(Int32(slot), p.baseAddress! + 4, Int32(sLen)))
+    }
     lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
   }
   // 0x24: select the inspection source — 0 = live body (stale if requestCount != R[expGenReg]),

@@ -260,10 +260,10 @@ int fm_largest_free_block(void) {
 // ---- JSON snapshot slots: owned copies of a response (sub)value that survive
 //      the next request. Grow-only buffers (realloc only when bigger) to avoid
 //      heap-fragmenting churn. Stable pointers so Swift can walk them in place.
-#define FM_NUM_SNAP 2
-static uint8_t *fm_snap[FM_NUM_SNAP]   = {nullptr, nullptr};
-static int      fm_snapCap[FM_NUM_SNAP] = {0, 0};
-static int      fm_snapLen[FM_NUM_SNAP] = {0, 0};
+#define FM_NUM_SNAP 5
+static uint8_t *fm_snap[FM_NUM_SNAP]    = {nullptr};   // rest zero-initialised
+static int      fm_snapCap[FM_NUM_SNAP] = {0};
+static int      fm_snapLen[FM_NUM_SNAP] = {0};
 // Returns 1 on success, 0 on alloc failure.
 int fm_snapshot_copy(int slot, const uint8_t *src, int len) {
   if (slot < 0 || slot >= FM_NUM_SNAP || len < 0) return 0;
