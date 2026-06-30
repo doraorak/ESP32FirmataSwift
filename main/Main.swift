@@ -110,6 +110,8 @@ let SCHED_EXT_STR_TO_NUM: UInt8   = 0x2B  // R[dst] = body parsed as int; R[foun
 let SCHED_EXT_JSON_GET_STRING: UInt8 = 0x2C  // copy a JSON string's content at path into a snapshot slot
 let SCHED_EXT_STR_SET_SLOT: UInt8 = 0x2D  // set a snapshot slot's content to a literal string
 let SCHED_EXT_STR_COPY_SLOT: UInt8 = 0x2E  // copy one snapshot slot's content into another
+let SCHED_EXT_I2C_READ: UInt8     = 0x2F  // R[dst] = <count> bytes read from I2C addr/reg, big-endian
+let SCHED_EXT_EMIT_STRING: UInt8  = 0x30  // device -> host: send a STRING_DATA frame to the master
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -881,9 +883,53 @@ final class Scheduler {
       strSetSlot(payload, payloadLen)
     case SCHED_EXT_STR_COPY_SLOT:     // 0x2E dst src
       strCopySlot(payload, payloadLen)
+    case SCHED_EXT_I2C_READ:          // 0x2F addr regLo regHi count dst
+      i2cReadReg(payload, payloadLen)
+    case SCHED_EXT_EMIT_STRING:       // 0x30 lenLo lenHi bytes…
+      emitString(payload, payloadLen)
     default:
       break
     }
+  }
+
+  // 0x2F: write the register pointer, read <count> (1…4) bytes from the I2C device,
+  //       and store them big-endian in R[dst]. Lets a task act on an I2C sensor with
+  //       nobody connected (the read reply is consumed on-device, not sent to a host).
+  func i2cReadReg(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 6 { return }
+    let address = UInt16(payload[1] & 0x7F)
+    let reg     = Int(payload[2]) | (Int(payload[3]) << 7)
+    var count   = Int(payload[4]); if count < 1 { count = 1 }; if count > 4 { count = 4 }
+    let dst     = Int(payload[5] & 0x0F)
+    fm_i2c_begin_transmission(Int32(address))
+    fm_i2c_write(Int32(reg))
+    _ = fm_i2c_end_transmission(1)
+    if i2cReadDelayUs != 0 { fm_delay_us(UInt32(i2cReadDelayUs)) }
+    let got = Int(fm_i2c_request_from(Int32(address), Int32(count)))
+    var v: Int32 = 0
+    var i = 0
+    while fm_i2c_available() != 0 && i < got && i < count {
+      v = (v << 8) | (Int32(fm_i2c_read()) & 0xFF); i += 1     // big-endian pack
+    }
+    regs[dst] = v
+  }
+
+  // 0x30: send a STRING_DATA frame (board -> host) so a running task can report a
+  //       message to a connected master (over TCP or BLE). No-op if nobody is connected.
+  func emitString(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 3 { return }
+    let sLen = Int(payload[1]) | (Int(payload[2]) << 7)
+    if 3 + sLen > payloadLen { return }
+    var out = [UInt8](repeating: 0, count: 3 + sLen * 2)
+    var n = 0
+    out[n] = START_SYSEX; n += 1
+    out[n] = STRING_DATA; n += 1
+    for k in 0..<sLen {
+      out[n] = payload[3 + k] & 0x7F; n += 1                   // LSB (ASCII char)
+      out[n] = 0; n += 1                                       // MSB
+    }
+    out[n] = END_SYSEX; n += 1
+    sendFrame(out, n)
   }
 
   // ---- Internet action: a task (or a live host) makes an HTTP(S) request over
