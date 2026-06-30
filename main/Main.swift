@@ -1197,7 +1197,7 @@ final class Scheduler {
     lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
   }
   // 0x2C: copy the CONTENT (unquoted) of the JSON string at <path> from the LIVE body into
-  //       snapshot slot <slot>. Backs board.json.getString → a StringHandle for board.string.
+  //       snapshot slot <slot>. Backs board.json.getString → a TaskString for board.string.
   func jsonGetString(_ payload: [UInt8], _ payloadLen: Int) {
     if payloadLen < 4 { return }
     let slot = Int(payload[1]); if slot < 0 || slot >= NUM_SNAP { return }
@@ -1211,8 +1211,8 @@ final class Scheduler {
     let ok = Int(fm_snapshot_copy(Int32(slot), buf + s + 1, Int32((e - 1) - (s + 1))))
     lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
   }
-  // 0x2D: set snapshot slot <slot> to the literal string in the payload — backs the
-  //       standalone StringHandle initialiser (board.string ops then run on the slot).
+  // 0x2D: set snapshot slot <slot> to the literal string in the payload — backs
+  //       board.string.createString (board.string ops then run on the slot).
   func strSetSlot(_ payload: [UInt8], _ payloadLen: Int) {
     if payloadLen < 4 { return }
     let slot = Int(payload[1]); if slot < 0 || slot >= NUM_SNAP { return }
@@ -1223,7 +1223,7 @@ final class Scheduler {
     }
     lastStatus = (ok != 0) ? ST_OK : ST_ALLOC_FAILED
   }
-  // 0x2E: copy snapshot slot <src> content into slot <dst> (backs string changeSlot / snapshotString).
+  // 0x2E: copy snapshot slot <src> content into slot <dst> (backs string changeSlot).
   func strCopySlot(_ payload: [UInt8], _ payloadLen: Int) {
     if payloadLen < 3 { return }
     let dst = Int(payload[1]); let src = Int(payload[2])
