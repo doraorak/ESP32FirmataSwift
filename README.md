@@ -169,8 +169,8 @@ gracefully.
 
 ```swift
 try await client.uploadTask(id: 3, repeatEvery: .seconds(1)) { t in
-    t.setPinMode(2, mode: .output)
-    t.analogRead(into: .reg(0), channel: 0)        // R0 = analogRead(A0)
+    t.setPinMode(.pin(2), mode: .output)
+    t.analogRead(into: .reg(0), channel: .channel(0))        // R0 = analogRead(A0)
     t.ifTrue(.reg(0), .lessThan, .number(300),     // if dark
         then:   { $0.digitalWrite(pin: 2, high: true) },   // LED on
         elseDo: { $0.digitalWrite(pin: 2, high: false) })
@@ -190,7 +190,7 @@ so the device acts on web data (a stock quote, a JSON field, …) autonomously:
 
 ```swift
 try await client.uploadTask(id: 5, repeatEvery: .seconds(60)) { t in
-    t.setPinMode(2, mode: .output)
+    t.setPinMode(.pin(2), mode: .output)
     let spy = t.httpGet("https://example.com/quote/SPY")
     let pct = t.json.getNumber(spy.body, "changePercent", scaledBy: 2)   // -0.42 -> -42
     t.ifTrue(pct, .greaterThan, .number(0),
