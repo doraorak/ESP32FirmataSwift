@@ -689,10 +689,16 @@ final class Scheduler {
     sendFrame([START_SYSEX, SCHEDULER_DATA, SCHED_ERROR_REPLY, id, END_SYSEX], 5)
   }
 
+  // Task bodies may themselves contain CREATE/ADD/SCHEDULE/DELETE messages (the
+  // client recorder's `addTask`/`deleteTask` — a task spawning tasks). They arrive
+  // here through the replay handler exactly like host messages. The one hazard is a
+  // task deleting then re-creating its OWN id mid-run: never hand out the instance
+  // currently being replayed (`running`), whose data/pos `execute()` is iterating.
   func create(_ id: UInt8, _ len: UInt16) {
     if find(id) != nil || len > UInt16(MAX_TASK_BYTES) { sendError(id); return }
     for i in 0..<MAX_TASKS where !tasks[i].used {
       let t = tasks[i]
+      if let r = running, r === t { continue }   // instance being replayed is off-limits
       t.used = true; t.id = id; t.time_ms = 0; t.len = len; t.pos = 0
       return
     }
