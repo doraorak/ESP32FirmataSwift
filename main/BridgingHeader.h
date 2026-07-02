@@ -1,9 +1,9 @@
-//===----------------------------------------------------------------------===//
-// BridgingHeader.h — the vendor-API surface Embedded Swift calls.
-// All of these are thin bridges implemented in firmata_shim.cpp (no logic),
-// except the four Arduino HAL I/O functions, which Swift calls directly.
-// String arguments are passed as `const uint8_t*` (StaticString / byte buffers).
-//===----------------------------------------------------------------------===//
+/* ===----------------------------------------------------------------------===//
+   BridgingHeader.h — the vendor-API surface Embedded Swift calls.
+   All of these are thin bridges implemented in firmata_shim.cpp (no logic),
+   except the four Arduino HAL I/O functions, which Swift calls directly.
+   String arguments are passed as `const uint8_t*` (StaticString / byte buffers).
+   ===----------------------------------------------------------------------===// */
 #pragma once
 #include <stdint.h>
 

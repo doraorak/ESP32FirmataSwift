@@ -1,19 +1,16 @@
-//===----------------------------------------------------------------------===//
-// firmata_shim.cpp — BRIDGING ONLY.
-//
-// No implementation logic lives here. Every function is a thin wrapper over a
-// vendor (Arduino / ESP-IDF) API so Embedded Swift can reach it. The protocol,
-// Scheduler, logic extension, transport orchestration (Wi-Fi/Bonjour/TCP + BLE),
-// arbitration and the main loop are all in Main.swift.
-//
-// Two things are unavoidably C++ and are kept to pure forwarding:
-//   * BLE callback classes — Swift can't subclass a C++ class, so these just
-//     push bytes into a FIFO / set event flags that Swift polls.
-//   * `app_main` — the ESP-IDF entry; it inits Arduino and calls Swift `sw_main`.
-//
-// String arguments are passed from Swift as `const uint8_t*` (StaticString /
-// byte buffers) and cast to `char*` here.
-//===----------------------------------------------------------------------===//
+/* ===----------------------------------------------------------------------===//
+   firmata_shim.cpp — BRIDGING ONLY.
+   No implementation logic lives here. Every function is a thin wrapper over a
+   vendor (Arduino / ESP-IDF) API so Embedded Swift can reach it. The protocol,
+   Scheduler, logic extension, transport orchestration (Wi-Fi/Bonjour/TCP + BLE),
+   arbitration and the main loop are all in Main.swift.
+   Two things are unavoidably C++ and are kept to pure forwarding:
+     * BLE callback classes — Swift can't subclass a C++ class, so these just
+       push bytes into a FIFO / set event flags that Swift polls.
+     * `app_main` — the ESP-IDF entry; it inits Arduino and calls Swift `sw_main`.
+   String arguments are passed from Swift as `const uint8_t*` (StaticString /
+   byte buffers) and cast to `char*` here.
+   ===----------------------------------------------------------------------===// */
 #include "Arduino.h"
 #include "esp_log.h"
 #include "WiFi.h"
@@ -22,9 +19,9 @@
 #include "ESPmDNS.h"
 #include "Wire.h"
 
-// IDF certificate bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y) — browser-like
-// root CA set, so HTTPS certs are validated. Same approach works in the Arduino
-// sketch (the core embeds the same bundle).
+/* IDF certificate bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y) — browser-like
+   root CA set, so HTTPS certs are validated. Same approach works in the Arduino
+   sketch (the core embeds the same bundle). */
 extern const uint8_t fm_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
 extern const uint8_t fm_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
 #include "BLEDevice.h"
@@ -32,11 +29,10 @@ extern const uint8_t fm_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
 #include "BLEUtils.h"
 #include "BLE2902.h"
 
-// ===========================================================================
-//  Encrypted Wi-Fi provisioning crypto + NVS (mbedTLS + Preferences).
-//  Ephemeral X25519 ECDH -> HKDF-SHA256 -> AES-256-GCM. Mirrors the C++
-//  firmware (ESP32Firmata); Swift drives it via fm_wc_* / fm_nvs_* below.
-// ===========================================================================
+/* ==== Encrypted Wi-Fi provisioning crypto + NVS (mbedTLS + Preferences).
+    Ephemeral X25519 ECDH -> HKDF-SHA256 -> AES-256-GCM. Mirrors the C++
+    firmware (ESP32Firmata); Swift drives it via fm_wc_* / fm_nvs_* below.
+   ==================== */
 #include <Preferences.h>
 #include <esp_random.h>
 #include <mbedtls/ecdh.h>
@@ -150,15 +146,13 @@ void fm_nvs_clear_creds(void) { Preferences p; p.begin("wifiprov", false); p.cle
 
 extern "C" void sw_main(void);   // Swift owns all logic + the run loop
 
-// ===========================================================================
-//  Time / GPIO / ADC / Serial  (Arduino HAL passthroughs)
-// ===========================================================================
+/* ==== Time / GPIO / ADC / Serial  (Arduino HAL passthroughs) ============ */
 extern "C" {
 void         fm_serial_begin(unsigned baud) { Serial.begin(baud); }
 
-// Console logging is gated: once a host starts speaking Firmata over USB serial,
-// log lines would corrupt the binary stream, so fm_console_quiet() silences both
-// our own fm_log() and the IDF/Arduino runtime logs for the rest of the session.
+/* Console logging is gated: once a host starts speaking Firmata over USB serial,
+   log lines would corrupt the binary stream, so fm_console_quiet() silences both
+   our own fm_log() and the IDF/Arduino runtime logs for the rest of the session. */
 static bool  fm_logs_on = true;
 void         fm_console_quiet(void)         { fm_logs_on = false; esp_log_level_set("*", ESP_LOG_NONE); }
 void         fm_log(const uint8_t *s)       { if (fm_logs_on) Serial.println((const char *)s); }
@@ -189,9 +183,7 @@ int  fm_i2c_request_from(int addr, int n) { return Wire.requestFrom(addr, n); }
 int  fm_i2c_available(void)               { return Wire.available(); }
 int  fm_i2c_read(void)                    { return Wire.read(); }
 
-// ===========================================================================
-//  Wi-Fi / mDNS  (each call is one vendor API; Swift sequences them)
-// ===========================================================================
+/* ==== Wi-Fi / mDNS  (each call is one vendor API; Swift sequences them) ==== */
 void fm_wifi_begin(const uint8_t *ssid, const uint8_t *pass, const uint8_t *host) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -218,11 +210,10 @@ void fm_mdns_add_txt(const uint8_t *svc, const uint8_t *proto, const uint8_t *k,
   MDNS.addServiceTxt((const char *)svc, (const char *)proto, (const char *)k, (const char *)v);
 }
 
-// ===========================================================================
-//  HTTP client  (Arduino HTTPClient over Wi-Fi; Swift sequences the call and
-//  decides what to do with the result). Response body is held here until the
-//  next request; Swift copies it out via fm_http_resp_len / fm_http_resp_copy.
-// ===========================================================================
+/* ==== HTTP client  (Arduino HTTPClient over Wi-Fi; Swift sequences the call and
+    decides what to do with the result). Response body is held here until the
+    next request; Swift copies it out via fm_http_resp_len / fm_http_resp_copy.
+   ==================== */
 } // extern "C"
 static String httpBody;
 extern "C" {
@@ -269,9 +260,9 @@ int fm_largest_free_block(void) {
   return (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 }
 
-// ---- JSON snapshot slots: owned copies of a response (sub)value that survive
-//      the next request. Grow-only buffers (realloc only when bigger) to avoid
-//      heap-fragmenting churn. Stable pointers so Swift can walk them in place.
+/* ---- JSON snapshot slots: owned copies of a response (sub)value that survive
+        the next request. Grow-only buffers (realloc only when bigger) to avoid
+        heap-fragmenting churn. Stable pointers so Swift can walk them in place. */
 #define FM_NUM_SNAP 12
 static uint8_t *fm_snap[FM_NUM_SNAP]    = {nullptr};   // rest zero-initialised
 static int      fm_snapCap[FM_NUM_SNAP] = {0};
@@ -302,9 +293,7 @@ int fm_http_resp_copy(uint8_t *dst, int max) {
 }
 } // extern "C"
 
-// ===========================================================================
-//  TCP server / client  (one vendor op each; Swift drives accept/read/write)
-// ===========================================================================
+/* ==== TCP server / client  (one vendor op each; Swift drives accept/read/write) ==== */
 static WiFiServer *tcpServer = nullptr;
 static WiFiClient  tcpClient;
 static WiFiClient  tcpIncoming;
@@ -321,11 +310,10 @@ void fm_tcp_write(const uint8_t *b, int n) { if (tcpClient && tcpClient.connecte
 void fm_tcp_drop(void)        { if (tcpClient && tcpClient.connected()) tcpClient.stop(); }
 } // extern "C"
 
-// ===========================================================================
-//  BLE Nordic UART Service.
-//  Callbacks are pure forwarders into a FIFO / event flags that Swift polls —
-//  no protocol/transport logic here. (Swift can't subclass these C++ classes.)
-// ===========================================================================
+/* ==== BLE Nordic UART Service.
+    Callbacks are pure forwarders into a FIFO / event flags that Swift polls —
+    no protocol/transport logic here. (Swift can't subclass these C++ classes.)
+   ==================== */
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -402,8 +390,6 @@ int  fm_ble_rx_pop(void) {
   return r;
 }
 
-// ===========================================================================
-//  ESP-IDF entry — init Arduino, hand everything to Swift.
-// ===========================================================================
+/* ==== ESP-IDF entry — init Arduino, hand everything to Swift. =========== */
 void app_main(void) { initArduino(); sw_main(); }
 } // extern "C"

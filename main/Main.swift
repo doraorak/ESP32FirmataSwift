@@ -1,31 +1,23 @@
-//===----------------------------------------------------------------------===//
-// Main.swift — Embedded Swift port of ESP32Firmata.ino (Firmata 2.x firmware).
-//
-// A faithful, section-by-section conversion of the original Arduino sketch's
-// protocol logic to Embedded Swift: the Firmata parser & message builders, pin
-// I/O handlers, I2C logic, the Firmata Scheduler (Encoder7Bit packing) and the
-// non-standard on-device register/if-else logic extension (see NONSTANDARD.md).
-//
-// Everything that can't be expressed in Embedded Swift — the Arduino hardware
-// APIs and the Wi-Fi/TCP+Bonjour transport — lives in firmata_shim.cpp and is
-// reached through the `fm_*` C functions. The transport calls back into the
-// `sw_*` entry points at the bottom of this file.
-//
-// Transport scope: Wi-Fi + Bonjour only (BLE omitted by request).
-//===----------------------------------------------------------------------===//
+/*
+ * Main.swift — ESP32 Firmata firmware in Embedded Swift.
+ *
+ * All protocol logic lives here: the Firmata parser and message builders, pin
+ * and I2C handlers, transport arbitration (TCP / BLE / USB serial, latest-wins),
+ * the Scheduler, and the on-device task extension (registers, branches,
+ * arithmetic, HTTP + JSON/string inspection, nested tasks — ext ops 0x10–0x30,
+ * spec in README.md). Hardware and radio access goes through the `fm_*` C
+ * functions in firmata_shim.cpp; C calls back in through the `sw_*` entry
+ * points at the bottom of this file. Swift owns the run loop.
+ */
 
-// ===========================================================================
-//  Firmware identity (firmware-report message)
-// ===========================================================================
+/* ==== Firmware identity (firmware-report message) ======================= */
 let FIRMWARE_NAME: StaticString = "swiftFirmataESP32"
 let FIRMWARE_MAJOR: UInt8 = 2
 let FIRMWARE_MINOR: UInt8 = 8
 let PROTOCOL_MAJOR: UInt8 = 2
 let PROTOCOL_MINOR: UInt8 = 8
 
-// ===========================================================================
-//  Firmata protocol constants
-// ===========================================================================
+/* ==== Firmata protocol constants ======================================== */
 let ANALOG_MESSAGE: UInt8        = 0xE0
 let DIGITAL_MESSAGE: UInt8       = 0x90
 let REPORT_ANALOG: UInt8         = 0xC0
@@ -130,9 +122,7 @@ let PIN_MODE_PWM: UInt8    = 0x03
 let PIN_MODE_I2C: UInt8    = 0x06
 let PIN_MODE_PULLUP: UInt8 = 0x0B
 
-// ===========================================================================
-//  ESP32 pin model
-// ===========================================================================
+/* ==== ESP32 pin model =================================================== */
 let TOTAL_PINS = 40
 let NUM_PORTS  = (TOTAL_PINS + 7) / 8          // 5
 let ANALOG_PINS: [Int] = [32, 33, 34, 35, 36, 39]
@@ -154,9 +144,7 @@ func analogChannelOfPin(_ pin: Int) -> Int {
 }
 func pinOfAnalogChannel(_ ch: Int) -> Int { (ch >= 0 && ch < NUM_ANALOG) ? ANALOG_PINS[ch] : -1 }
 
-// ===========================================================================
-//  Parser + scheduler types
-// ===========================================================================
+/* ==== Parser + scheduler types ========================================== */
 let SYSEX_MAX = 512   // large enough for an HTTP op's URL + body in one SysEx
 
 struct ParserState {
@@ -181,9 +169,7 @@ final class SchedTask {
   var data = [UInt8](repeating: 0, count: MAX_TASK_BYTES)
 }
 
-// ===========================================================================
-//  Runtime pin / reporting state
-// ===========================================================================
+/* ==== Runtime pin / reporting state ===================================== */
 var pinModes      = [UInt8](repeating: PIN_MODE_INPUT, count: TOTAL_PINS)
 var pinValues     = [Int](repeating: 0, count: TOTAL_PINS)
 var pinConfigured = [Bool](repeating: false, count: TOTAL_PINS)
@@ -223,17 +209,13 @@ let TR_BLE: UInt8    = 2
 let TR_SERIAL: UInt8 = 3
 var activeTransport: UInt8 = TR_NONE
 
-// ===========================================================================
-//  PWM -> Arduino analogWrite (LEDC). Firmata duty is 8-bit (0..255).
-// ===========================================================================
+/* ==== PWM -> Arduino analogWrite (LEDC). Firmata duty is 8-bit (0..255). ==== */
 @inline(__always) func pwm(_ pin: Int, _ value: Int) {
   let v = value < 0 ? 0 : (value > 255 ? 255 : value)
   analogWrite(UInt8(pin), Int32(v))
 }
 
-// ===========================================================================
-//  Outgoing frame transport (routes to the current master)
-// ===========================================================================
+/* ==== Outgoing frame transport (routes to the current master) =========== */
 func sendFrame(_ buf: [UInt8], _ len: Int) {
   if activeTransport == TR_TCP {
     buf.withUnsafeBufferPointer { fm_tcp_write($0.baseAddress, Int32(len)) }
@@ -244,9 +226,7 @@ func sendFrame(_ buf: [UInt8], _ len: Int) {
   }
 }
 
-// ===========================================================================
-//  Outgoing Firmata messages
-// ===========================================================================
+/* ==== Outgoing Firmata messages ========================================= */
 func sendProtocolVersion() { sendFrame([REPORT_VERSION, PROTOCOL_MAJOR, PROTOCOL_MINOR], 3) }
 
 func sendFirmwareReport() {
@@ -335,12 +315,9 @@ func sendI2CReply(_ address: UInt16, _ reg: Int, _ data: [UInt8], _ count: Int) 
   sendFrame(frameBuf, n)
 }
 
-// ===========================================================================
-//  Pin I/O handlers
-// ===========================================================================
-// ===========================================================================
-//  I2C device helpers (shared by the live handler and periodic sampling)
-// ===========================================================================
+/* ==== Pin I/O handlers
+    I2C device helpers (shared by the live handler and periodic sampling)
+   ==================== */
 func i2cRead(_ address: UInt16, _ reg: Int, _ count0: UInt16) {
   if reg >= 0 {
     fm_i2c_begin_transmission(Int32(address))
@@ -369,14 +346,12 @@ func stopContinuousRead(_ address: UInt16) {
   for i in 0..<MAX_CONT_READS where contReads[i].active && contReads[i].address == address { contReads[i].active = false }
 }
 
-// ===========================================================================
-//  Live protocol handler
-//
-//  Parses an incoming Firmata byte stream (its own ParserState) and applies
-//  each command. One instance drives the live transport; a second instance
-//  drives scheduler task replay. Both act on shared device state and route
-//  scheduler SysEx to the shared `Scheduler`.
-// ===========================================================================
+/* ==== Live protocol handler
+    Parses an incoming Firmata byte stream (its own ParserState) and applies
+    each command. One instance drives the live transport; a second instance
+    drives scheduler task replay. Both act on shared device state and route
+    scheduler SysEx to the shared `Scheduler`.
+   ==================== */
 final class FirmataProtocol {
   var ps = ParserState()
   var sched: Scheduler!            // wired once at startup (see sw_main)
@@ -615,10 +590,9 @@ final class FirmataProtocol {
   }
 }
 
-// ===========================================================================
-//  Encoder7Bit helpers (8-bit data packed into 7-bit bytes), shared by the
-//  Scheduler and used against the shared `frameBuf`.
-// ===========================================================================
+/* ==== Encoder7Bit helpers (8-bit data packed into 7-bit bytes), shared by the
+    Scheduler and used against the shared `frameBuf`.
+   ==================== */
 func sched7BitDecode(_ outBytes: Int, _ inp: [UInt8], _ out: inout [UInt8]) {
   let inLen = inp.count
   for i in 0..<outBytes {
@@ -650,14 +624,12 @@ func sched7BitPut(_ n: inout Int, _ shift: inout UInt8, _ prev: inout UInt8, _ d
   }
 }
 
-// ===========================================================================
-//  Firmata Scheduler (SysEx 0x7B)
-//
-//  Stores tasks (recorded Firmata bytes + delays) and replays them — through a
-//  dedicated FirmataProtocol instance (`replay`) — even with no host connected.
-//  Also owns the non-standard logic extension (16 Int32 registers, if/else and
-//  internet actions).
-// ===========================================================================
+/* ==== Firmata Scheduler (SysEx 0x7B)
+    Stores tasks (recorded Firmata bytes + delays) and replays them — through a
+    dedicated FirmataProtocol instance (`replay`) — even with no host connected.
+    Also owns the non-standard logic extension (16 Int32 registers, if/else and
+    internet actions).
+   ==================== */
 final class Scheduler {
   var tasks: [SchedTask] = {
     var a: [SchedTask] = []
@@ -692,11 +664,11 @@ final class Scheduler {
     sendFrame([START_SYSEX, SCHEDULER_DATA, SCHED_ERROR_REPLY, id, END_SYSEX], 5)
   }
 
-  // Task bodies may themselves contain CREATE/ADD/SCHEDULE/DELETE messages (the
-  // client recorder's `addTask`/`deleteTask` — a task spawning tasks). They arrive
-  // here through the replay handler exactly like host messages. The one hazard is a
-  // task deleting then re-creating its OWN id mid-run: never hand out the instance
-  // currently being replayed (`running`), whose data/pos `execute()` is iterating.
+  /* Task bodies may themselves contain CREATE/ADD/SCHEDULE/DELETE messages (the
+     client recorder's `addTask`/`deleteTask` — a task spawning tasks). They arrive
+     here through the replay handler exactly like host messages. The one hazard is a
+     task deleting then re-creating its OWN id mid-run: never hand out the instance
+     currently being replayed (`running`), whose data/pos `execute()` is iterating. */
   func create(_ id: UInt8, _ len: UInt16) {
     if find(id) != nil || len > UInt16(MAX_TASK_BYTES) { sendError(id); return }
     for i in 0..<MAX_TASKS where !tasks[i].used {
@@ -761,9 +733,9 @@ final class Scheduler {
     sendFrame(frameBuf, n)
   }
 
-  // ---- NON-STANDARD logic extension (NONSTANDARD.md) ----
-  // An operand carries both an int and a float view; `isFloat` says which one is
-  // authoritative (so a comparison promotes to float when either side is float).
+  /* ---- NON-STANDARD logic extension (NONSTANDARD.md) ----
+     An operand carries both an int and a float view; `isFloat` says which one is
+     authoritative (so a comparison promotes to float when either side is float). */
   struct Operand { var isFloat: Bool; var i: Int32; var f: Float }
 
   // Trap-free Float → Int32 (NaN/overflow clamp).
@@ -901,9 +873,9 @@ final class Scheduler {
     }
   }
 
-  // 0x2F: write the register pointer, read <count> (1…4) bytes from the I2C device,
-  //       and store them big-endian in R[dst]. Lets a task act on an I2C sensor with
-  //       nobody connected (the read reply is consumed on-device, not sent to a host).
+  /* 0x2F: write the register pointer, read <count> (1…4) bytes from the I2C device,
+           and store them big-endian in R[dst]. Lets a task act on an I2C sensor with
+           nobody connected (the read reply is consumed on-device, not sent to a host). */
   func i2cReadReg(_ payload: [UInt8], _ payloadLen: Int) {
     if payloadLen < 6 { return }
     let address = UInt16(payload[1] & 0x7F)
@@ -941,13 +913,13 @@ final class Scheduler {
     sendFrame(out, n)
   }
 
-  // ---- Internet action: a task (or a live host) makes an HTTP(S) request over
-  //      the board's Wi-Fi. Layout of the ext payload:
-  //        0x15 method statusReg urlLo urlHi url[urlLen] bodyLo bodyHi body[bodyLen]
-  //      method 0=GET 1=POST. URL/body are raw ASCII (7-bit). On execution
-  //      R[statusReg] = HTTP status (0 = Wi-Fi down / error); the full response
-  //      body is retained for the inspection ops (JSON_NUM / *_STR_* / BODY_*).
-  //      If a host is connected, status + body are also sent as SCHED_EXT_HTTP_REPLY.
+  /* ---- Internet action: a task (or a live host) makes an HTTP(S) request over
+          the board's Wi-Fi. Layout of the ext payload:
+            0x15 method statusReg urlLo urlHi url[urlLen] bodyLo bodyHi body[bodyLen]
+          method 0=GET 1=POST. URL/body are raw ASCII (7-bit). On execution
+          R[statusReg] = HTTP status (0 = Wi-Fi down / error); the full response
+          body is retained for the inspection ops (JSON_NUM / *_STR_* / BODY_*).
+          If a host is connected, status + body are also sent as SCHED_EXT_HTTP_REPLY. */
   func http(_ payload: [UInt8], _ payloadLen: Int) {
     if payloadLen < 5 { return }
     let method    = payload[1]
@@ -981,11 +953,11 @@ final class Scheduler {
     regs[Int(payload[1] & 0x0F)] = requestCount
   }
 
-  // ====== Response inspection — walks the selected source IN PLACE ======
-  // Source is the live body (fm_http_resp_ptr) or a snapshot slot, chosen by
-  // SELECT. Returns (ptr, len, stale) — `stale` is set when a borrowed (live)
-  // source was selected against an out-of-date generation. Each op records a
-  // result-status in `lastStatus` (read with SCHED_EXT_LAST_STATUS).
+  /* ====== Response inspection — walks the selected source IN PLACE ======
+     Source is the live body (fm_http_resp_ptr) or a snapshot slot, chosen by
+     SELECT. Returns (ptr, len, stale) — `stale` is set when a borrowed (live)
+     source was selected against an out-of-date generation. Each op records a
+     result-status in `lastStatus` (read with SCHED_EXT_LAST_STATUS). */
   func inspectBuf() -> (UnsafePointer<UInt8>?, Int, Bool) {
     if inspectSel == 0 { return (fm_http_resp_ptr(), Int(fm_http_resp_len()), inspectStale) }
     let s = Int32(inspectSel - 1)
@@ -1145,9 +1117,9 @@ final class Scheduler {
     regs[dst] = r
   }
 
-  // 0x27: comparison. R[dst] = (A <op> B) ? 1 : 0  (op: 0== 1!= 2< 3> 4<= 5>=).
-  // Reuses the same operand decoding + float-promoting compare as SCHED_EXT_IF, so a
-  // task can materialise a reusable boolean register instead of branching inline.
+  /* 0x27: comparison. R[dst] = (A <op> B) ? 1 : 0  (op: 0== 1!= 2< 3> 4<= 5>=).
+     Reuses the same operand decoding + float-promoting compare as SCHED_EXT_IF, so a
+     task can materialise a reusable boolean register instead of branching inline. */
   func cmp(_ payload: [UInt8], _ payloadLen: Int) {
     if payloadLen < 3 { return }
     let op = payload[1], dst = Int(payload[2] & 0x0F)
@@ -1563,9 +1535,7 @@ final class Scheduler {
   }
 }
 
-// ===========================================================================
-//  Periodic sampling (device -> host)
-// ===========================================================================
+/* ==== Periodic sampling (device -> host) ================================ */
 func checkDigitalInputs() {
   for port in 0..<NUM_PORTS {
     if !reportPort[port] { continue }
@@ -1595,9 +1565,7 @@ func sampleAnalogAndI2C() {
   }
 }
 
-// ===========================================================================
-//  Reset
-// ===========================================================================
+/* ==== Reset ============================================================= */
 func resetSessionState() {
   liveHandler.ps = ParserState()
   analogReportMask = 0
@@ -1648,9 +1616,7 @@ func claimMaster(_ who: UInt8) {
 
 func transportConnected() -> Bool { activeTransport != TR_NONE }
 
-// ===========================================================================
-//  Periodic work (scheduler + sampling), run each loop iteration
-// ===========================================================================
+/* ==== Periodic work (scheduler + sampling), run each loop iteration ===== */
 func loopTick() {
   scheduler.tick()
   if transportConnected() {
@@ -1663,9 +1629,7 @@ func loopTick() {
   }
 }
 
-// ===========================================================================
-//  User configuration
-// ===========================================================================
+/* ==== User configuration ================================================ */
 let WIFI_SSID: StaticString = "YOUR_WIFI_SSID"
 let WIFI_PASS: StaticString = "YOUR_WIFI_PASSWORD"
 let MDNS_HOST: StaticString = "esp32-firmata"
@@ -1722,9 +1686,7 @@ func applyActiveCreds() -> Bool {
   return false
 }
 
-// ===========================================================================
-//  Transport — Wi-Fi / Bonjour (orchestration in Swift; vendor calls bridged)
-// ===========================================================================
+/* ==== Transport — Wi-Fi / Bonjour (orchestration in Swift; vendor calls bridged) ==== */
 func startBonjour() {
   if fm_mdns_begin(cs(MDNS_HOST)) != 0 {
     fm_mdns_add_service(cs("firmata"), cs("tcp"), TCP_PORT)
@@ -1866,9 +1828,7 @@ func tcpPoll() {
   }
 }
 
-// ===========================================================================
-//  Transport — BLE (orchestration in Swift; vendor events bridged via FIFO/flags)
-// ===========================================================================
+/* ==== Transport — BLE (orchestration in Swift; vendor events bridged via FIFO/flags) ==== */
 func bleSend(_ buf: [UInt8], _ len: Int) {
   let mtu = Int(fm_ble_mtu())
   let chunk = mtu > 23 ? mtu - 3 : 20
@@ -1884,10 +1844,10 @@ func bleSend(_ buf: [UInt8], _ len: Int) {
   }
 }
 
-// Firmata over USB serial (UART0 — the log console port). The first byte a host
-// sends claims the session: the console goes quiet (logs would corrupt frames)
-// and serial becomes the master until another transport claims it. There is no
-// serial "disconnect" event, so the claim persists until eviction or reboot.
+/* Firmata over USB serial (UART0 — the log console port). The first byte a host
+   sends claims the session: the console goes quiet (logs would corrupt frames)
+   and serial becomes the master until another transport claims it. There is no
+   serial "disconnect" event, so the claim persists until eviction or reboot. */
 func serialPoll() {
   var g = 0
   while fm_serial_available() != 0 && g < 1024 {
@@ -1913,9 +1873,7 @@ func blePoll() {
   while b >= 0 && g < 4096 { liveHandler.process(UInt8(b & 0xFF)); g += 1; b = fm_ble_rx_pop() }
 }
 
-// ===========================================================================
-//  Entry point — ESP-IDF app_main (C) calls sw_main(); Swift owns the run loop.
-// ===========================================================================
+/* ==== Entry point — ESP-IDF app_main (C) calls sw_main(); Swift owns the run loop. ==== */
 @_cdecl("sw_main")
 public func sw_main() {
   // Wire the handler/scheduler cross-references (singletons that live forever).
