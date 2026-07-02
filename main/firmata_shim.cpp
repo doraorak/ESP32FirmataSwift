@@ -15,6 +15,7 @@
 // byte buffers) and cast to `char*` here.
 //===----------------------------------------------------------------------===//
 #include "Arduino.h"
+#include "esp_log.h"
 #include "WiFi.h"
 #include "WiFiClientSecure.h"   // HTTPS (TLS via ssl_client / mbedTLS)
 #include "HTTPClient.h"
@@ -154,7 +155,18 @@ extern "C" void sw_main(void);   // Swift owns all logic + the run loop
 // ===========================================================================
 extern "C" {
 void         fm_serial_begin(unsigned baud) { Serial.begin(baud); }
-void         fm_log(const uint8_t *s)       { Serial.println((const char *)s); }
+
+// Console logging is gated: once a host starts speaking Firmata over USB serial,
+// log lines would corrupt the binary stream, so fm_console_quiet() silences both
+// our own fm_log() and the IDF/Arduino runtime logs for the rest of the session.
+static bool  fm_logs_on = true;
+void         fm_console_quiet(void)         { fm_logs_on = false; esp_log_level_set("*", ESP_LOG_NONE); }
+void         fm_log(const uint8_t *s)       { if (fm_logs_on) Serial.println((const char *)s); }
+
+// Raw serial I/O for Firmata-over-USB (UART0 — the same port as the log console).
+int32_t      fm_serial_available(void)      { return (int32_t)Serial.available(); }
+int32_t      fm_serial_read(void)           { return (int32_t)Serial.read(); }   // -1 when empty
+void         fm_serial_write(const uint8_t *b, int32_t n) { Serial.write(b, (size_t)n); }
 void         fm_analog_setup(void) {
   analogReadResolution(12);
 #if defined(ADC_11db)

@@ -216,10 +216,11 @@ var frameBuf = [UInt8](repeating: 0, count: 2048)
 // echoed back to a connected host (so the host can parse the full body).
 let HTTP_PARSE_MAX = 4096
 
-// Dual-transport master arbitration (latest-wins). Wi-Fi-only build -> TCP/none.
-let TR_NONE: UInt8 = 0
-let TR_TCP: UInt8  = 1
-let TR_BLE: UInt8  = 2
+// Transport master arbitration (latest-wins): TCP, BLE, or USB serial.
+let TR_NONE: UInt8   = 0
+let TR_TCP: UInt8    = 1
+let TR_BLE: UInt8    = 2
+let TR_SERIAL: UInt8 = 3
 var activeTransport: UInt8 = TR_NONE
 
 // ===========================================================================
@@ -238,6 +239,8 @@ func sendFrame(_ buf: [UInt8], _ len: Int) {
     buf.withUnsafeBufferPointer { fm_tcp_write($0.baseAddress, Int32(len)) }
   } else if activeTransport == TR_BLE {
     bleSend(buf, len)
+  } else if activeTransport == TR_SERIAL {
+    buf.withUnsafeBufferPointer { fm_serial_write($0.baseAddress, Int32(len)) }
   }
 }
 
@@ -1881,6 +1884,23 @@ func bleSend(_ buf: [UInt8], _ len: Int) {
   }
 }
 
+// Firmata over USB serial (UART0 — the log console port). The first byte a host
+// sends claims the session: the console goes quiet (logs would corrupt frames)
+// and serial becomes the master until another transport claims it. There is no
+// serial "disconnect" event, so the claim persists until eviction or reboot.
+func serialPoll() {
+  var g = 0
+  while fm_serial_available() != 0 && g < 1024 {
+    let b = fm_serial_read()
+    if b < 0 { break }
+    if activeTransport != TR_SERIAL {
+      fm_console_quiet()
+      claimMaster(TR_SERIAL)
+    }
+    liveHandler.process(UInt8(b & 0xFF)); g += 1
+  }
+}
+
 func blePoll() {
   if fm_ble_poll_connect() != 0 {
     fm_log(cs("BLE central connected")); claimMaster(TR_BLE)
@@ -1914,6 +1934,7 @@ public func sw_main() {
   while true {
     tcpPoll()
     blePoll()
+    serialPoll()
     loopTick()
     fm_delay_ms(1)
   }

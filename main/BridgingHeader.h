@@ -16,6 +16,10 @@ void     analogWrite(uint8_t pin, int value);
 // --- Time / GPIO / ADC / Serial ---
 void          fm_serial_begin(unsigned baud);
 void          fm_log(const uint8_t *s);
+void          fm_console_quiet(void);
+int32_t       fm_serial_available(void);
+int32_t       fm_serial_read(void);
+void          fm_serial_write(const uint8_t *b, int32_t n);
 void          fm_analog_setup(void);
 void          fm_pin_mode(int pin, int mode);        // 0=INPUT 1=OUTPUT 2=INPUT_PULLUP
 unsigned int  fm_millis(void);
