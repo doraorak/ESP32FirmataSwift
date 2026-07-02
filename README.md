@@ -53,13 +53,9 @@ Swift has no official Xtensa backend, so this uses a **custom toolchain**:
 Espressif's Xtensa LLVM backend grafted into Apple's `llvm-project`, with
 `swiftc` built against it.
 
-```bash
-git clone https://github.com/doraorak/swift-xtensa-esp32
-cd swift-xtensa-esp32
-./swift-xtensa-build-script.sh          # one-time, a few hours -> install/bin/swiftc
-```
-
-The build script handles the hard parts: the Clang/LLVM Xtensa **datalayout
+Set it up following [georgik/swift-xtensa](https://github.com/georgik/swift-xtensa)
+(one-time build, a few hours → a `swiftc` that targets `xtensa-esp32-none-elf`).
+The hard parts the toolchain build covers: the Clang/LLVM Xtensa **datalayout
 mismatch**, forcing the **static relocation model** (Xtensa rejects PIC), and
 the Embedded-Swift unicode stubs. The resulting `swiftc` is IDF-independent —
 it emits a plain Xtensa `.o` that links with any IDF.
