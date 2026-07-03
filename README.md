@@ -140,6 +140,8 @@ STR_SET_SLOT   F0 7B 7F 2D <slot> <strLen:2> <str…>                     F7  //
 STR_COPY_SLOT  F0 7B 7F 2E <dst> <src>                                  F7  // copy slot -> slot
 I2C_READ       F0 7B 7F 2F <addr> <regLo> <regHi> <count> <dst>         F7  // 1–4 bytes -> R[dst] (BE)
 EMIT_STRING    F0 7B 7F 30 <lenLo> <lenHi> <bytes…>                     F7  // task -> host STRING_DATA
+REG_QUERY      F0 7B 7F 31                                             F7  // reply with all registers
+REG_REPLY      F0 7B 0C <16×5B ints> <8×5B float bits>                  F7  // device -> host snapshot
 HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                 F7  // device -> host
 ```
 
@@ -167,6 +169,13 @@ HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                 F7  //
   (`CREATE 0x00` / `ADD 0x02` / `SCHEDULE 0x04` / `DELETE 0x01`) — they are
   dispatched by the replay handler like host traffic. `CREATE` never hands out
   the slot currently being replayed, so a task cannot replace itself mid-run.
+- `REG_QUERY`/`REG_REPLY`: each value is 5 little-endian 7-bit limbs (ints as
+  two's-complement bit patterns, floats as IEEE 754 bits). Works live — the host
+  polls shared state — or from inside a task.
+- **Servo** (2.8+): `SERVO_CONFIG` (`F0 70 <pin> <minLo minHi> <maxLo maxHi> F7`)
+  sets the pulse range and enters servo mode; `setPinMode 0x04` uses the
+  544–2400 µs default. Analog/extended-analog writes to a servo pin mean
+  degrees when `< 544`, pulse µs otherwise (LEDC, 50 Hz / 14-bit).
 - Base Scheduler messages and limits: 8 task slots, 512 bytes/task, ids 0–127;
   a one-shot removes itself; a trailing `DELAY` loops the task.
 

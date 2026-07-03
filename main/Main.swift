@@ -41,6 +41,7 @@ let I2C_REQUEST: UInt8             = 0x76
 let I2C_REPLY: UInt8               = 0x77
 let I2C_CONFIG: UInt8              = 0x78
 let REPORT_FIRMWARE: UInt8         = 0x79
+let SERVO_CONFIG: UInt8            = 0x70
 let SAMPLING_INTERVAL: UInt8       = 0x7A
 let SCHEDULER_DATA: UInt8          = 0x7B
 
@@ -66,6 +67,7 @@ let SCHED_ERROR_REPLY: UInt8     = 0x08
 let SCHED_QUERY_ALL_REPLY: UInt8 = 0x09
 let SCHED_QUERY_REPLY: UInt8     = 0x0A
 let SCHED_EXT_HTTP_REPLY: UInt8  = 0x0B   // device -> host: status + response body
+let SCHED_REG_REPLY: UInt8       = 0x0C   // device -> host: R0-15 + F0-7 snapshot
 
 // Logic extension (NONSTANDARD.md) under EXTENDED_SCHEDULER_COMMAND (0x7F)
 let SCHED_EXT_COMMAND: UInt8      = 0x7F
@@ -104,6 +106,7 @@ let SCHED_EXT_STR_SET_SLOT: UInt8 = 0x2D  // set a snapshot slot's content to a 
 let SCHED_EXT_STR_COPY_SLOT: UInt8 = 0x2E  // copy one snapshot slot's content into another
 let SCHED_EXT_I2C_READ: UInt8     = 0x2F  // R[dst] = <count> bytes read from I2C addr/reg, big-endian
 let SCHED_EXT_EMIT_STRING: UInt8  = 0x30  // device -> host: send a STRING_DATA frame to the master
+let SCHED_EXT_REG_QUERY: UInt8    = 0x31  // report all registers to the host (SCHED_REG_REPLY)
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -119,6 +122,7 @@ let PIN_MODE_INPUT: UInt8  = 0x00
 let PIN_MODE_OUTPUT: UInt8 = 0x01
 let PIN_MODE_ANALOG: UInt8 = 0x02
 let PIN_MODE_PWM: UInt8    = 0x03
+let PIN_MODE_SERVO: UInt8  = 0x04
 let PIN_MODE_I2C: UInt8    = 0x06
 let PIN_MODE_PULLUP: UInt8 = 0x0B
 
@@ -171,6 +175,9 @@ final class SchedTask {
 
 /* ==== Runtime pin / reporting state ===================================== */
 var pinModes      = [UInt8](repeating: PIN_MODE_INPUT, count: TOTAL_PINS)
+/* Servo pulse range per pin (SERVO_CONFIG overrides the 544-2400 us defaults). */
+var servoMinUs    = [Int32](repeating: 544, count: TOTAL_PINS)
+var servoMaxUs    = [Int32](repeating: 2400, count: TOTAL_PINS)
 var pinValues     = [Int](repeating: 0, count: TOTAL_PINS)
 var pinConfigured = [Bool](repeating: false, count: TOTAL_PINS)
 var analogReportMask: UInt16 = 0
@@ -252,6 +259,7 @@ func sendCapabilityResponse() {
       frameBuf[n] = PIN_MODE_PULLUP; n += 1; frameBuf[n] = 1; n += 1
       frameBuf[n] = PIN_MODE_OUTPUT; n += 1; frameBuf[n] = 1; n += 1
       frameBuf[n] = PIN_MODE_PWM;    n += 1; frameBuf[n] = 8; n += 1
+      frameBuf[n] = PIN_MODE_SERVO;  n += 1; frameBuf[n] = 14; n += 1
       if pin == I2C_SDA_PIN || pin == I2C_SCL_PIN { frameBuf[n] = PIN_MODE_I2C; n += 1; frameBuf[n] = 1; n += 1 }
       if analogChannelOfPin(pin) >= 0 { frameBuf[n] = PIN_MODE_ANALOG; n += 1; frameBuf[n] = 12; n += 1 }
     } else if isInputOnly(pin) {
@@ -356,8 +364,25 @@ final class FirmataProtocol {
   var ps = ParserState()
   var sched: Scheduler!            // wired once at startup (see sw_main)
 
+  /* Servo value semantics (standard Firmata): < 544 is an angle in degrees
+     (0-180 mapped onto the pin's pulse range); >= 544 is a raw pulse width in us. */
+  func servoOut(_ pin: Int, _ value: Int) {
+    var us: Int32
+    if value < 544 {
+      let a = Int32(value < 0 ? 0 : (value > 180 ? 180 : value))
+      us = servoMinUs[pin] + (servoMaxUs[pin] - servoMinUs[pin]) * a / 180
+    } else {
+      us = Int32(value)
+      if us < servoMinUs[pin] { us = servoMinUs[pin] }
+      if us > servoMaxUs[pin] { us = servoMaxUs[pin] }
+    }
+    fm_servo_write_us(Int32(pin), us)
+    pinValues[pin] = Int(us)
+  }
+
   func handleSetPinMode(_ pin: Int, _ mode: UInt8) {
     if pin >= TOTAL_PINS { return }
+    if pinModes[pin] == PIN_MODE_SERVO && mode != PIN_MODE_SERVO { fm_servo_detach(Int32(pin)) }
     switch mode {
     case PIN_MODE_INPUT:
       if isUsable(pin) { fm_pin_mode(Int32(pin), 0); pinModes[pin] = mode; pinConfigured[pin] = true }
@@ -369,11 +394,28 @@ final class FirmataProtocol {
       if analogChannelOfPin(pin) >= 0 { pinModes[pin] = mode }
     case PIN_MODE_PWM:
       if isFullDigital(pin) { pinModes[pin] = mode; pwm(pin, 0); pinValues[pin] = 0 }
+    case PIN_MODE_SERVO:
+      if isFullDigital(pin) {
+        fm_servo_attach(Int32(pin))
+        pinModes[pin] = mode; pinValues[pin] = 0; pinConfigured[pin] = true
+      }
     case PIN_MODE_I2C:
       pinModes[pin] = mode
     default:
       break
     }
+  }
+
+  /* SERVO_CONFIG (0x70): pin, minPulse (14-bit LE), maxPulse (14-bit LE). Sets the
+     pulse range and puts the pin in servo mode (standard Firmata behaviour). */
+  func handleServoConfig(_ data: [UInt8], _ len: Int) {
+    if len < 5 { return }
+    let pin = Int(data[0])
+    if pin >= TOTAL_PINS || !isFullDigital(pin) { return }
+    let minUs = Int32(data[1] & 0x7F) | (Int32(data[2] & 0x7F) << 7)
+    let maxUs = Int32(data[3] & 0x7F) | (Int32(data[4] & 0x7F) << 7)
+    if minUs > 0 && maxUs > minUs { servoMinUs[pin] = minUs; servoMaxUs[pin] = maxUs }
+    handleSetPinMode(pin, PIN_MODE_SERVO)
   }
 
   func handleSetDigitalPinValue(_ pin: Int, _ value: UInt8) {
@@ -401,6 +443,7 @@ final class FirmataProtocol {
     if pin >= TOTAL_PINS { return }
     let value = Int(lsb & 0x7F) | (Int(msb & 0x7F) << 7)
     if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
+    else if pinModes[pin] == PIN_MODE_SERVO { servoOut(pin, value) }
   }
 
   func handleReportAnalog(_ channel: Int, _ enable: UInt8) {
@@ -437,6 +480,7 @@ final class FirmataProtocol {
     var value = 0
     for i in 1..<len { value |= Int(data[i] & 0x7F) << (7 * (i - 1)) }
     if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
+    else if pinModes[pin] == PIN_MODE_SERVO { servoOut(pin, value) }
   }
 
   func handleI2CConfig(_ data: [UInt8], _ len: Int) {
@@ -520,6 +564,7 @@ final class FirmataProtocol {
         if samplingInterval < MIN_SAMPLING { samplingInterval = MIN_SAMPLING }
       }
     case STRING_DATA:          handleString(data, dlen)
+    case SERVO_CONFIG:         handleServoConfig(data, dlen)
     case I2C_CONFIG:           handleI2CConfig(data, dlen)
     case I2C_REQUEST:          handleI2CRequest(data, dlen)
     case SCHEDULER_DATA:       sched.handleSysex(data, dlen)
@@ -868,6 +913,8 @@ final class Scheduler {
       i2cReadReg(payload, payloadLen)
     case SCHED_EXT_EMIT_STRING:       // 0x30 lenLo lenHi bytes…
       emitString(payload, payloadLen)
+    case SCHED_EXT_REG_QUERY:         // 0x31: snapshot R0-15 + F0-7 to the host
+      regReport()
     default:
       break
     }
@@ -893,6 +940,26 @@ final class Scheduler {
       v = (v << 8) | (Int32(fm_i2c_read()) & 0xFF); i += 1     // big-endian pack
     }
     regs[dst] = v
+  }
+
+  /* 0x31: report every register to the connected host as SCHED_REG_REPLY —
+     16 Int32s then 8 float bit-patterns, each as 5 little-endian 7-bit limbs.
+     Works live (host polls shared state) or from inside a task. */
+  func regReport() {
+    var n = 0
+    frameBuf[n] = START_SYSEX; n += 1
+    frameBuf[n] = SCHEDULER_DATA; n += 1
+    frameBuf[n] = SCHED_REG_REPLY; n += 1
+    for i in 0..<NUM_SCHED_REGS {
+      var v = UInt32(bitPattern: regs[i])
+      for _ in 0..<5 { frameBuf[n] = UInt8(v & 0x7F); n += 1; v >>= 7 }
+    }
+    for i in 0..<NUM_FLOAT_REGS {
+      var v = fregs[i].bitPattern
+      for _ in 0..<5 { frameBuf[n] = UInt8(v & 0x7F); n += 1; v >>= 7 }
+    }
+    frameBuf[n] = END_SYSEX; n += 1
+    sendFrame(frameBuf, n)
   }
 
   // 0x30: send a STRING_DATA frame (board -> host) so a running task can report a

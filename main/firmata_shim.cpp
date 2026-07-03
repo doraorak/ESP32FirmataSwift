@@ -158,6 +158,17 @@ void         fm_console_quiet(void)         { fm_logs_on = false; esp_log_level_
 void         fm_log(const uint8_t *s)       { if (fm_logs_on) Serial.println((const char *)s); }
 
 // Raw serial I/O for Firmata-over-USB (UART0 — the same port as the log console).
+/* Servo via LEDC (Arduino core 3.x API): 50 Hz, 14-bit resolution. Duty for a
+   pulse of W us in a 20 ms frame = W * 2^14 / 20000. */
+void         fm_servo_attach(int32_t pin)   { ledcAttach((uint8_t)pin, 50, 14); }
+void         fm_servo_detach(int32_t pin)   { ledcDetach((uint8_t)pin); }
+void         fm_servo_write_us(int32_t pin, int32_t us) {
+  if (us < 0) us = 0;
+  uint32_t duty = (uint32_t)((uint64_t)us * 16384u / 20000u);
+  if (duty > 16383u) duty = 16383u;
+  ledcWrite((uint8_t)pin, duty);
+}
+
 int32_t      fm_serial_available(void)      { return (int32_t)Serial.available(); }
 int32_t      fm_serial_read(void)           { return (int32_t)Serial.read(); }   // -1 when empty
 void         fm_serial_write(const uint8_t *b, int32_t n) { Serial.write(b, (size_t)n); }
