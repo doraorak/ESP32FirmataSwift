@@ -13,7 +13,7 @@
 /* ==== Firmware identity (firmware-report message) ======================= */
 let FIRMWARE_NAME: StaticString = "swiftFirmataESP32"
 let FIRMWARE_MAJOR: UInt8 = 2
-let FIRMWARE_MINOR: UInt8 = 8
+let FIRMWARE_MINOR: UInt8 = 9
 let PROTOCOL_MAJOR: UInt8 = 2
 let PROTOCOL_MINOR: UInt8 = 8
 
@@ -46,6 +46,9 @@ let SAMPLING_INTERVAL: UInt8       = 0x7A
 let SCHEDULER_DATA: UInt8          = 0x7B
 
 // Encrypted Wi-Fi provisioning (non-standard; top-level user-range SysEx 0x0C).
+let MODULE_DATA: UInt8 = 0x0D      // module subsystem (user-range SysEx)
+let MODULE_QUERY: UInt8 = 0x00
+let MODULE_LIST_REPLY: UInt8 = 0x7F
 let WIFI_CONFIG: UInt8 = 0x0C
 let WC_SET:    UInt8 = 0x00   // host->dev: <clientPub><nonce><ciphertext+tag>
 let WC_FORGET: UInt8 = 0x01   // host->dev: clear stored creds
@@ -107,6 +110,8 @@ let SCHED_EXT_STR_COPY_SLOT: UInt8 = 0x2E  // copy one snapshot slot's content i
 let SCHED_EXT_I2C_READ: UInt8     = 0x2F  // R[dst] = <count> bytes read from I2C addr/reg, big-endian
 let SCHED_EXT_EMIT_STRING: UInt8  = 0x30  // device -> host: send a STRING_DATA frame to the master
 let SCHED_EXT_REG_QUERY: UInt8    = 0x31  // report all registers to the host (SCHED_REG_REPLY)
+let SCHED_EXT_WRITE_PIN: UInt8    = 0x32  // write a pin from an operand: kind(0=digital,1=analog) pin <operand>
+let SCHED_EXT_MODULE_OP: UInt8    = 0x33  // deliver a payload to a module from a task
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -568,6 +573,7 @@ final class FirmataProtocol {
     case I2C_CONFIG:           handleI2CConfig(data, dlen)
     case I2C_REQUEST:          handleI2CRequest(data, dlen)
     case SCHEDULER_DATA:       sched.handleSysex(data, dlen)
+    case MODULE_DATA:          handleModuleData(data, dlen)
     case WIFI_CONFIG:          handleWiFiConfig(data, dlen)
     default:                   break
     }
@@ -915,6 +921,10 @@ final class Scheduler {
       emitString(payload, payloadLen)
     case SCHED_EXT_REG_QUERY:         // 0x31: snapshot R0-15 + F0-7 to the host
       regReport()
+    case SCHED_EXT_WRITE_PIN:         // 0x32 kind pin <operand>
+      writePinOp(payload, payloadLen)
+    case SCHED_EXT_MODULE_OP:         // 0x33 <moduleId> <payload…>
+      if payloadLen >= 2 { moduleDispatch(payload[1], Array(payload[2..<payloadLen]), payloadLen - 2) }
     default:
       break
     }
@@ -940,6 +950,29 @@ final class Scheduler {
       v = (v << 8) | (Int32(fm_i2c_read()) & 0xFF); i += 1     // big-endian pack
     }
     regs[dst] = v
+  }
+
+  /* 0x32: write a pin from an OPERAND (register or literal) — the piece that
+     lets task values drive outputs: kind 0 = digital (non-zero -> HIGH, OUTPUT
+     pins only), kind 1 = analog, routed by the pin's mode (PWM duty or servo
+     degrees/us). Float operands truncate. */
+  func writePinOp(_ payload: [UInt8], _ payloadLen: Int) {
+    if payloadLen < 4 { return }
+    let kind = payload[1]
+    let pin = Int(payload[2] & 0x7F)
+    if pin >= TOTAL_PINS { return }
+    var i = 3
+    let v = readOperand(payload, payloadLen, &i)
+    let value = Int(v.isFloat ? f2i(v.f) : v.i)
+    if kind == 0 {
+      if pinModes[pin] == PIN_MODE_OUTPUT {
+        digitalWrite(UInt8(pin), value != 0 ? 1 : 0)
+        pinValues[pin] = value != 0 ? 1 : 0
+      }
+    } else {
+      if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
+      else if pinModes[pin] == PIN_MODE_SERVO { replay.servoOut(pin, value) }
+    }
   }
 
   /* 0x31: report every register to the connected host as SCHED_REG_REPLY —
@@ -1603,6 +1636,166 @@ final class Scheduler {
 }
 
 /* ==== Periodic sampling (device -> host) ================================ */
+/* ==== Module subsystem ====================================================
+   Compile-time firmware plugins behind one reserved SysEx (MODULE_DATA 0x0D)
+   and one task ext op (MODULE_OP 0x33). A module is native Embedded Swift; the
+   C++ shim only exposes peripherals. Discovery: MODULE_QUERY lists (id, ver,
+   name). Convention: modules read their own payloads and put results in the
+   scheduler registers, which plugs them into ifTrue/tasks for free. */
+
+let IR_MODULE_ID: UInt8 = 0x01
+
+/* (id, major, minor, name) of every compiled-in module. */
+let moduleTable: [(UInt8, UInt8, UInt8, StaticString)] = [
+  (IR_MODULE_ID, 1, 0, "ir"),
+]
+
+func moduleDispatch(_ id: UInt8, _ payload: [UInt8], _ n: Int) {
+  switch id {
+  case IR_MODULE_ID: irHandle(payload, n)
+  default: break
+  }
+}
+
+func moduleTick() {
+  irTick()
+}
+
+func handleModuleData(_ data: [UInt8], _ dlen: Int) {
+  if dlen < 1 { return }
+  if data[0] == MODULE_QUERY {
+    var n = 0
+    frameBuf[n] = START_SYSEX; n += 1
+    frameBuf[n] = MODULE_DATA; n += 1
+    frameBuf[n] = MODULE_LIST_REPLY; n += 1
+    frameBuf[n] = UInt8(moduleTable.count); n += 1
+    for m in moduleTable {
+      frameBuf[n] = m.0; n += 1
+      frameBuf[n] = m.1; n += 1
+      frameBuf[n] = m.2; n += 1
+      frameBuf[n] = UInt8(m.3.utf8CodeUnitCount); n += 1
+      m.3.withUTF8Buffer { buf in
+        for b in buf { frameBuf[n] = b & 0x7F; n += 1 }
+      }
+    }
+    frameBuf[n] = END_SYSEX; n += 1
+    sendFrame(frameBuf, n)
+    return
+  }
+  moduleDispatch(data[0], Array(data[1..<dlen]), dlen - 1)
+}
+
+/* ==== IR module (NEC over RMT) — pure Swift ===============================
+   ops: 0x00 <pin> = configure TX (38 kHz carrier); 0x01 <code:5 limbs> = send
+   a 32-bit NEC frame (MSB-first code); 0x02 <pin> <dstReg> = start RX — each
+   decoded frame lands in R[dstReg] and is pushed to the host as event 0x03. */
+
+var irTxPin: Int32 = -1
+var irRxPin: Int32 = -1
+var irDstReg = 0
+var irRxBuf = [Int32](repeating: 0, count: 192)   // reused; no per-tick allocation
+var irRawBuf = [Int32](repeating: 0, count: 128)  // reused; raw-send durations from op 0x03
+var irLastCapture = [Int32](repeating: 0, count: 40)  // debug: first durations of last capture
+var irLastCaptureCount = 0
+var irCaptureTotal = 0                                 // debug: captures seen since boot
+
+func irHandle(_ p: [UInt8], _ n: Int) {
+  if n < 1 { return }
+  switch p[0] {
+  case 0x00:
+    // Configure the TX pin. The carrier is set per send by the raw op (0x03).
+    if n >= 2 && fm_rmt_tx_init(Int32(p[1] & 0x7F), 0) != 0 { irTxPin = Int32(p[1] & 0x7F) }
+  case 0x02:
+    if n >= 3 && fm_rmt_rx_init(Int32(p[1] & 0x7F)) != 0 {
+      irRxPin = Int32(p[1] & 0x7F)
+      irDstReg = Int(p[2] & 0x0F)
+    }
+  case 0x03:
+    // Raw send: <carrierKHz> <duration pairs as 14-bit LE>. Marks HIGH; carrierKHz 0 = no
+    // carrier. NEC, RC6, and any other protocol are encoded host-side and replayed here.
+    if n >= 4 && irTxPin >= 0 {
+      let khz = Int32(p[1] & 0x7F)
+      _ = fm_rmt_tx_carrier(irTxPin, 0, 33, khz * 1000)   // marks-high carrier at khz (0 = off)
+      var count = 0
+      var k = 2
+      while k + 1 < n && count < irRawBuf.count {
+        irRawBuf[count] = Int32(p[k] & 0x7F) | (Int32(p[k + 1] & 0x7F) << 7)
+        count += 1; k += 2
+      }
+      irRawBuf.withUnsafeBufferPointer { fm_rmt_tx(irTxPin, $0.baseAddress, Int32(count)) }
+    }
+  case 0x7C:
+    // Debug: invert the TX envelope. <invert 0/1> (0 = mark HIGH, 1 = mark LOW)
+    if n >= 2 { fm_rmt_tx_set_invert(Int32(p[1] & 0x01)) }
+  case 0x7D:
+    // Debug: retune the TX carrier live. <polarity 0/1> <dutyPercent 0..100> <freqKHz>
+    if n >= 4 && irTxPin >= 0 {
+      let pol = Int32(p[1] & 0x01)
+      let duty = Int32(p[2] & 0x7F)
+      let freq = Int32(p[3] & 0x7F) * 1000
+      _ = fm_rmt_tx_carrier(irTxPin, pol, duty, freq)
+    }
+  case 0x7E:
+    // Debug: dump the last capture (count + durations as 14-bit LE pairs).
+    var out: [UInt8] = [START_SYSEX, MODULE_DATA, IR_MODULE_ID, 0x7E,
+                        UInt8(irCaptureTotal & 0x7F), UInt8(irLastCaptureCount & 0x7F),
+                        UInt8(truncatingIfNeeded: irTxPin + 1) & 0x7F,
+                        UInt8(truncatingIfNeeded: irRxPin + 1) & 0x7F,
+                        UInt8(truncatingIfNeeded: fm_rmt_rx_status()) & 0x7F,
+                        UInt8(truncatingIfNeeded: fm_rmt_tx_last() + 1) & 0x7F]
+    var k = 0
+    while k < irLastCaptureCount {
+      var d = irLastCapture[k]
+      if d < 0 { d = 0 }
+      if d > 16383 { d = 16383 }
+      out.append(UInt8(d & 0x7F))
+      out.append(UInt8((d >> 7) & 0x7F))
+      k += 1
+    }
+    out.append(END_SYSEX)
+    sendFrame(out, out.count)
+  default: break
+  }
+}
+
+/* NEC decode with ±25% tolerance; level-agnostic (works with active-low TSOP
+   receivers): only the duration SEQUENCE matters. */
+func irNear(_ v: Int32, _ target: Int32) -> Bool {
+  v > target - target / 4 && v < target + target / 4
+}
+
+func irTick() {
+  if irRxPin < 0 { return }
+  let n = irRxBuf.withUnsafeMutableBufferPointer { fm_rmt_rx_poll($0.baseAddress, 192) }
+  if n > 0 {                                       // debug: stash every capture
+    irCaptureTotal += 1
+    irLastCaptureCount = min(Int(n), 40)
+    for k in 0..<irLastCaptureCount { irLastCapture[k] = irRxBuf[k] }
+  }
+  if n < 66 { return }
+  // find the 9 ms / 4.5 ms header, then read 32 bit pairs
+  var i = 0
+  while i + 1 < Int(n) && !(irNear(irRxBuf[i], 9000) && irNear(irRxBuf[i + 1], 4500)) { i += 1 }
+  if i + 66 > Int(n) { return }
+  i += 2
+  var code: UInt32 = 0
+  var k = 0
+  while k < 32 {
+    let mark = irRxBuf[i], space = irRxBuf[i + 1]
+    if !irNear(mark, 562) { return }
+    if irNear(space, 1687) { code = (code << 1) | 1 }
+    else if irNear(space, 562) { code = code << 1 }
+    else { return }
+    i += 2; k += 1
+  }
+  scheduler.regs[irDstReg] = Int32(bitPattern: code)
+  var out: [UInt8] = [START_SYSEX, MODULE_DATA, IR_MODULE_ID, 0x03]
+  var v = code
+  for _ in 0..<5 { out.append(UInt8(v & 0x7F)); v >>= 7 }
+  out.append(END_SYSEX)
+  sendFrame(out, out.count)
+}
+
 func checkDigitalInputs() {
   for port in 0..<NUM_PORTS {
     if !reportPort[port] { continue }
@@ -1686,6 +1879,7 @@ func transportConnected() -> Bool { activeTransport != TR_NONE }
 /* ==== Periodic work (scheduler + sampling), run each loop iteration ===== */
 func loopTick() {
   scheduler.tick()
+  moduleTick()
   if transportConnected() {
     checkDigitalInputs()
     let now = fm_millis()

@@ -158,6 +158,84 @@ void         fm_console_quiet(void)         { fm_logs_on = false; esp_log_level_
 void         fm_log(const uint8_t *s)       { if (fm_logs_on) Serial.println((const char *)s); }
 
 // Raw serial I/O for Firmata-over-USB (UART0 — the same port as the log console).
+/* ==== RMT primitives for the module subsystem ============================
+   1 MHz tick (1 us per duration). The shim exposes the PERIPHERAL only —
+   protocol logic (e.g. the IR module's NEC encode/decode) lives with the
+   module in the firmware's own language. Durations alternate mark/space. */
+#include "esp32-hal-rmt.h"
+
+static int32_t fm_rx_status = 0;   // 0 untried, 1 ok, 2 rmtInit failed, 3 readAsync failed
+static int32_t fm_tx_last = -1;    // last rmtWrite result (1/0), -1 = never
+
+int32_t fm_rmt_tx_init(int32_t pin, int32_t carrier_hz) {
+  if (!rmtInit((int)pin, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 1000000)) return 0;
+  if (carrier_hz > 0) rmtSetCarrier((int)pin, true, false, (uint32_t)carrier_hz, 0.33f);
+  return 1;
+}
+
+static int fm_tx_invert = 0;   // debug: 0 = mark HIGH/space LOW, 1 = mark LOW/space HIGH
+void fm_rmt_tx_set_invert(int32_t inv) { fm_tx_invert = inv ? 1 : 0; }
+
+void fm_rmt_tx(int32_t pin, const int32_t *durations, int32_t count) {
+  static rmt_data_t sym[64];
+  uint8_t markLvl  = fm_tx_invert ? 0 : 1;   // level during a "mark" (durations[even])
+  uint8_t spaceLvl = fm_tx_invert ? 1 : 0;
+  int n = 0;
+  for (int i = 0; i < count && n < 64; i += 2) {
+    uint32_t d0 = durations[i]     > 32767 ? 32767 : (uint32_t)durations[i];
+    uint32_t d1 = (i + 1 < count && durations[i+1] > 0)
+                  ? (durations[i+1] > 32767 ? 32767 : (uint32_t)durations[i+1]) : 1;
+    sym[n].level0 = markLvl;  sym[n].duration0 = d0;
+    sym[n].level1 = spaceLvl; sym[n].duration1 = d1;
+    n++;
+  }
+  fm_tx_last = rmtWrite((int)pin, sym, n, 200) ? 1 : 0;
+}
+
+static rmt_data_t fm_rx_buf[96];
+static size_t     fm_rx_len = 0;
+static bool       fm_rx_armed = false;
+static int        fm_rx_pin = -1;
+
+int32_t fm_rmt_rx_init(int32_t pin) {
+  if (!rmtInit((int)pin, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) { fm_rx_status = 2; return 0; }
+  rmtSetRxMaxThreshold((int)pin, 12000);   // 12 ms idle ends a frame
+  // Glitch filter runs on the 80 MHz source clock (8-bit, max ~255 cycles ~= 3.2 us),
+  // NOT the 1 MHz resolution clock. A larger value makes rmt_receive() reject the
+  // config and reception silently never starts. 2 us is safely under the limit.
+  rmtSetRxMinThreshold((int)pin, 2);       // ignore sub-2 us glitches
+  fm_rx_pin = (int)pin;
+  fm_rx_len = sizeof(fm_rx_buf) / sizeof(fm_rx_buf[0]);
+  fm_rx_armed = rmtReadAsync(fm_rx_pin, fm_rx_buf, &fm_rx_len);
+  fm_rx_status = fm_rx_armed ? 1 : 3;
+  return fm_rx_armed ? 1 : 0;
+}
+
+int32_t fm_rmt_rx_status(void) { return fm_rx_status; }
+int32_t fm_rmt_tx_last(void)   { return fm_tx_last; }
+
+/* Set the TX carrier (duty as 0..100 percent, freq in Hz; 0 Hz disables it). Used by
+   the raw-send op to pick a per-protocol carrier, and by the live-retune debug op. */
+int32_t fm_rmt_tx_carrier(int32_t pin, int32_t polarity, int32_t duty_pct, int32_t freq_hz) {
+  float duty = (float)duty_pct / 100.0f;
+  return rmtSetCarrier((int)pin, freq_hz > 0, polarity != 0, (uint32_t)freq_hz, duty) ? 1 : 0;
+}
+
+/* Poll for a completed capture: fills out[] with alternating durations (us),
+   returns the count and re-arms; 0 when nothing has been received. */
+int32_t fm_rmt_rx_poll(int32_t *out, int32_t maxCount) {
+  if (!fm_rx_armed || fm_rx_pin < 0) return 0;
+  if (!rmtReceiveCompleted(fm_rx_pin)) return 0;
+  int n = 0;
+  for (size_t i = 0; i < fm_rx_len && n + 1 < maxCount; i++) {
+    out[n++] = (int32_t)fm_rx_buf[i].duration0;
+    out[n++] = (int32_t)fm_rx_buf[i].duration1;
+  }
+  fm_rx_len = sizeof(fm_rx_buf) / sizeof(fm_rx_buf[0]);
+  fm_rx_armed = rmtReadAsync(fm_rx_pin, fm_rx_buf, &fm_rx_len);
+  return n;
+}
+
 /* Servo via LEDC (Arduino core 3.x API): 50 Hz, 14-bit resolution. Duty for a
    pulse of W us in a 20 ms frame = W * 2^14 / 20000. */
 void         fm_servo_attach(int32_t pin)   { ledcAttach((uint8_t)pin, 50, 14); }
