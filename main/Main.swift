@@ -13,7 +13,7 @@
 /* ==== Firmware identity (firmware-report message) ======================= */
 let FIRMWARE_NAME: StaticString = "swiftFirmataESP32"
 let FIRMWARE_MAJOR: UInt8 = 2
-let FIRMWARE_MINOR: UInt8 = 9
+let FIRMWARE_MINOR: UInt8 = 10
 let PROTOCOL_MAJOR: UInt8 = 2
 let PROTOCOL_MINOR: UInt8 = 8
 
@@ -1659,6 +1659,7 @@ func moduleDispatch(_ id: UInt8, _ payload: [UInt8], _ n: Int) {
 
 func moduleTick() {
   irTick()
+  irTxTick()
 }
 
 func handleModuleData(_ data: [UInt8], _ dlen: Int) {
@@ -1694,10 +1695,38 @@ var irTxPin: Int32 = -1
 var irRxPin: Int32 = -1
 var irDstReg = 0
 var irRxBuf = [Int32](repeating: 0, count: 192)   // reused; no per-tick allocation
-var irRawBuf = [Int32](repeating: 0, count: 128)  // reused; raw-send durations from op 0x03
+var irRawBuf = [Int32](repeating: 0, count: 128)  // reused; raw-send durations (op 0x03/0x04)
+var irTxCount = 0                                  // durations currently staged in irRawBuf
+var irTxRepeatLeft = 0                             // pending re-sends for a hold (op 0x04)
+var irTxGapMs: UInt32 = 0                          // gap between held re-sends
+var irTxNextMs: UInt32 = 0                         // when the next held re-send is due
 var irLastCapture = [Int32](repeating: 0, count: 40)  // debug: first durations of last capture
 var irLastCaptureCount = 0
 var irCaptureTotal = 0                                 // debug: captures seen since boot
+
+// Parse 14-bit LE duration pairs from p[start...] into irRawBuf; send the staged frame.
+func irStageDurations(_ p: [UInt8], _ n: Int, from start: Int) {
+  var count = 0, k = start
+  while k + 1 < n && count < irRawBuf.count {
+    irRawBuf[count] = Int32(p[k] & 0x7F) | (Int32(p[k + 1] & 0x7F) << 7)
+    count += 1; k += 2
+  }
+  irTxCount = count
+}
+func irRawSend() {
+  if irTxCount > 0 { irRawBuf.withUnsafeBufferPointer { fm_rmt_tx(irTxPin, $0.baseAddress, Int32(irTxCount)) } }
+}
+// Non-blocking hold: re-send the staged frame every irTxGapMs until the repeat count runs out.
+func irTxTick() {
+  if irTxRepeatLeft > 0 && irTxPin >= 0 {
+    let now = fm_millis()
+    if now &- irTxNextMs < 0x8000_0000 {   // now >= irTxNextMs (unsigned wrap-safe)
+      irRawSend()
+      irTxRepeatLeft -= 1
+      irTxNextMs = now &+ irTxGapMs
+    }
+  }
+}
 
 func irHandle(_ p: [UInt8], _ n: Int) {
   if n < 1 { return }
@@ -1714,15 +1743,22 @@ func irHandle(_ p: [UInt8], _ n: Int) {
     // Raw send: <carrierKHz> <duration pairs as 14-bit LE>. Marks HIGH; carrierKHz 0 = no
     // carrier. NEC, RC6, and any other protocol are encoded host-side and replayed here.
     if n >= 4 && irTxPin >= 0 {
-      let khz = Int32(p[1] & 0x7F)
-      _ = fm_rmt_tx_carrier(irTxPin, 0, 33, khz * 1000)   // marks-high carrier at khz (0 = off)
-      var count = 0
-      var k = 2
-      while k + 1 < n && count < irRawBuf.count {
-        irRawBuf[count] = Int32(p[k] & 0x7F) | (Int32(p[k + 1] & 0x7F) << 7)
-        count += 1; k += 2
-      }
-      irRawBuf.withUnsafeBufferPointer { fm_rmt_tx(irTxPin, $0.baseAddress, Int32(count)) }
+      _ = fm_rmt_tx_carrier(irTxPin, 0, 33, Int32(p[1] & 0x7F) * 1000)   // marks-high carrier (0 = off)
+      irTxRepeatLeft = 0                                                 // cancel any pending hold
+      irStageDurations(p, n, from: 2)
+      irRawSend()
+    }
+  case 0x04:
+    // Raw send with hold: <carrierKHz> <repeat> <gapLo> <gapHi> <durations>. Sends once now,
+    // then re-sends (repeat-1) more times, gapMs apart, from irTxTick (non-blocking).
+    if n >= 6 && irTxPin >= 0 {
+      _ = fm_rmt_tx_carrier(irTxPin, 0, 33, Int32(p[1] & 0x7F) * 1000)
+      let rep = Int(p[2] & 0x7F)
+      irTxGapMs = UInt32(p[3] & 0x7F) | (UInt32(p[4] & 0x7F) << 7)
+      irStageDurations(p, n, from: 5)
+      irRawSend()
+      irTxRepeatLeft = rep > 1 ? rep - 1 : 0
+      irTxNextMs = fm_millis() &+ irTxGapMs
     }
   case 0x7C:
     // Debug: invert the TX envelope. <invert 0/1> (0 = mark HIGH, 1 = mark LOW)
