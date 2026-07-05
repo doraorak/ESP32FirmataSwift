@@ -13,7 +13,7 @@
 /* ==== Firmware identity (firmware-report message) ======================= */
 let FIRMWARE_NAME: StaticString = "swiftFirmataESP32"
 let FIRMWARE_MAJOR: UInt8 = 2
-let FIRMWARE_MINOR: UInt8 = 10
+let FIRMWARE_MINOR: UInt8 = 11
 let PROTOCOL_MAJOR: UInt8 = 2
 let PROTOCOL_MINOR: UInt8 = 8
 
@@ -1695,17 +1695,19 @@ var irTxPin: Int32 = -1
 var irRxPin: Int32 = -1
 var irDstReg = 0
 var irRxBuf = [Int32](repeating: 0, count: 192)   // reused; no per-tick allocation
-var irRawBuf = [Int32](repeating: 0, count: 128)  // reused; raw-send durations (op 0x03/0x04)
-var irTxCount = 0                                  // durations currently staged in irRawBuf
-var irTxRepeatLeft = 0                             // pending re-sends for a hold (op 0x04)
-var irTxGapMs: UInt32 = 0                          // gap between held re-sends
-var irTxNextMs: UInt32 = 0                         // when the next held re-send is due
+var irRawBuf = [Int32](repeating: 0, count: 160)  // reused; raw-send durations (op 0x03/0x04)
+var irTxCount = 0                                  // total durations staged (frame A, then optional B)
+var irTxNA = 0                                     // durations in frame A; B = [irTxNA..<irTxCount]
+var irTxSendIdx = 0                                // send # in a repeat run (even=A, odd=B: RC6 toggle)
+var irTxRepeatLeft = 0                             // pending re-sends for a repeat (op 0x04)
+var irTxGapMs: UInt32 = 0                          // gap between repeated presses
+var irTxNextMs: UInt32 = 0                         // when the next repeated press is due
 var irLastCapture = [Int32](repeating: 0, count: 40)  // debug: first durations of last capture
 var irLastCaptureCount = 0
 var irCaptureTotal = 0                                 // debug: captures seen since boot
 
-// Parse 14-bit LE duration pairs from p[start...] into irRawBuf; send the staged frame.
-func irStageDurations(_ p: [UInt8], _ n: Int, from start: Int) {
+// Parse 14-bit LE duration pairs from p[start...] into irRawBuf.
+func irStage(_ p: [UInt8], _ n: Int, from start: Int) {
   var count = 0, k = start
   while k + 1 < n && count < irRawBuf.count {
     irRawBuf[count] = Int32(p[k] & 0x7F) | (Int32(p[k + 1] & 0x7F) << 7)
@@ -1713,15 +1715,23 @@ func irStageDurations(_ p: [UInt8], _ n: Int, from start: Int) {
   }
   irTxCount = count
 }
-func irRawSend() {
-  if irTxCount > 0 { irRawBuf.withUnsafeBufferPointer { fm_rmt_tx(irTxPin, $0.baseAddress, Int32(irTxCount)) } }
+// Send frame A (even idx) or frame B (odd idx, when a distinct B exists — the RC6 toggle
+// variant, so consecutive repeats read as separate presses). NEC/raw have no B → always A.
+func irSendFrame(_ idx: Int) {
+  if irTxCount <= 0 || irTxNA <= 0 { return }
+  let hasB = irTxCount > irTxNA
+  let useB = hasB && (idx & 1 == 1)
+  let off  = useB ? irTxNA : 0
+  let cnt  = useB ? irTxCount - irTxNA : irTxNA
+  irRawBuf.withUnsafeBufferPointer { fm_rmt_tx(irTxPin, $0.baseAddress! + off, Int32(cnt)) }
 }
-// Non-blocking hold: re-send the staged frame every irTxGapMs until the repeat count runs out.
+// Non-blocking repeat: re-send (alternating A/B) every irTxGapMs until the count runs out.
 func irTxTick() {
   if irTxRepeatLeft > 0 && irTxPin >= 0 {
     let now = fm_millis()
     if now &- irTxNextMs < 0x8000_0000 {   // now >= irTxNextMs (unsigned wrap-safe)
-      irRawSend()
+      irSendFrame(irTxSendIdx)
+      irTxSendIdx += 1
       irTxRepeatLeft -= 1
       irTxNextMs = now &+ irTxGapMs
     }
@@ -1744,19 +1754,25 @@ func irHandle(_ p: [UInt8], _ n: Int) {
     // carrier. NEC, RC6, and any other protocol are encoded host-side and replayed here.
     if n >= 4 && irTxPin >= 0 {
       _ = fm_rmt_tx_carrier(irTxPin, 0, 33, Int32(p[1] & 0x7F) * 1000)   // marks-high carrier (0 = off)
-      irTxRepeatLeft = 0                                                 // cancel any pending hold
-      irStageDurations(p, n, from: 2)
-      irRawSend()
+      irTxRepeatLeft = 0                                                 // cancel any pending repeat
+      irStage(p, n, from: 2)
+      irTxNA = irTxCount                                                 // one frame, no B
+      irSendFrame(0)
     }
   case 0x04:
-    // Raw send with hold: <carrierKHz> <repeat> <gapLo> <gapHi> <durations>. Sends once now,
-    // then re-sends (repeat-1) more times, gapMs apart, from irTxTick (non-blocking).
-    if n >= 6 && irTxPin >= 0 {
+    // Repeat/hold send: <carrierKHz> <repeat> <gapLo> <gapHi> <nA_lo> <nA_hi> <A durs> <B durs>.
+    // nA = durations in frame A; the rest are frame B (the RC6 toggle-flipped variant, so
+    // repeats are distinct presses). No B (all durs in A) → every repeat sends A (NEC/raw).
+    // Sends A now, then re-sends alternating A/B (repeat-1) more times, gapMs apart, via the tick.
+    if n >= 8 && irTxPin >= 0 {
       _ = fm_rmt_tx_carrier(irTxPin, 0, 33, Int32(p[1] & 0x7F) * 1000)
       let rep = Int(p[2] & 0x7F)
       irTxGapMs = UInt32(p[3] & 0x7F) | (UInt32(p[4] & 0x7F) << 7)
-      irStageDurations(p, n, from: 5)
-      irRawSend()
+      let nA = Int(p[5] & 0x7F) | (Int(p[6] & 0x7F) << 7)
+      irStage(p, n, from: 7)
+      irTxNA = nA < irTxCount ? nA : irTxCount
+      irSendFrame(0)
+      irTxSendIdx = 1
       irTxRepeatLeft = rep > 1 ? rep - 1 : 0
       irTxNextMs = fm_millis() &+ irTxGapMs
     }
