@@ -1,39 +1,38 @@
 # ESP32FirmataSwift
 
-Firmata firmware for the original ESP32 (Xtensa LX6), written in **Embedded
-Swift** on ESP-IDF. Speaks Firmata 2.x over Wi-Fi (Bonjour/TCP), BLE (Nordic
-UART), and USB serial — with an on-device task extension: registers, branches,
-arithmetic, HTTP + JSON inspection, strings, and tasks that spawn tasks.
+Firmata firmware for the ESP32 (Xtensa LX6), written in **Embedded Swift** on
+ESP-IDF. Speaks Firmata 2.x over Wi-Fi (Bonjour/TCP), BLE (Nordic UART), and USB
+serial, with an on-device task extension: registers, branches, loops, arithmetic,
+HTTP + JSON inspection, strings, and tasks that spawn tasks.
 
-## The project suite
+## The suite
 
 | Repo | Role |
 |---|---|
-| [SwiftFirmataClient](https://github.com/doraorak/SwiftFirmataClient) | macOS/iOS client package (start here for API + COOKBOOK) |
+| [SwiftFirmataClient](https://github.com/doraorak/SwiftFirmataClient) | macOS/iOS client package (start here for the API + COOKBOOK) |
 | [ESP32FirmataSwift](https://github.com/doraorak/ESP32FirmataSwift) | This repo — the Embedded Swift firmware |
-| [ESP32Firmata](https://github.com/doraorak/ESP32Firmata) | The same firmware in C++/Arduino (byte-identical wire protocol) |
+| [ESP32Firmata](https://github.com/doraorak/ESP32Firmata) | The same firmware in C++/Arduino (byte-identical wire) |
 
 ## Flash it
 
 ```bash
-./flash.sh                      # sources ESP-IDF, builds, flashes (first build is slow)
+./flash.sh                      # sources ESP-IDF, builds, flashes
 ./monitor.sh                    # 115200 console — shows IP / Bonjour / BLE status
 ```
 
 Override the port with `./flash.sh /dev/cu.XXXX`, the IDF path with `IDF_EXPORT=…`.
 No toolchain? Each [release](https://github.com/doraorak/ESP32FirmataSwift/releases)
 ships a prebuilt app image — flash it at **0x10000** with esptool, then provision
-Wi-Fi from the client (no rebuild needed). The board needs 4 MB flash
-(3 MB app partition, `partitions.csv`).
+Wi-Fi from the client. The board needs 4 MB flash (3 MB app partition).
 
 ## Wi-Fi credentials
 
-- **Compile-time**: set `WIFI_SSID` / `WIFI_PASS` near the bottom of
-  `main/Main.swift` before flashing.
+- **Compile-time**: set `WIFI_SSID` / `WIFI_PASS` at the top of
+  `main/Configuration.swift` before flashing.
 - **Provisioned**: leave the placeholders and send credentials from the client
-  (`provisionWiFi` — encrypted X25519 + AES-GCM, over BLE, TCP, or serial).
-  Stored in NVS only after a successful join; a wrong password rolls back to
-  the previous network, so the board can't be stranded.
+  (`provisionWiFi` — encrypted X25519 + AES-GCM, over BLE, TCP, or serial). Stored
+  in NVS only after a successful join; a wrong password rolls back to the previous
+  network, so the board can't be stranded.
 
 ## Connecting
 
@@ -41,24 +40,20 @@ Wi-Fi from the client (no rebuild needed). The board needs 4 MB flash
 |---|---|
 | Wi-Fi | `_firmata._tcp` on port **3030**, instance `esp32-firmata` (TXT carries `ip`/`port`) |
 | BLE | Nordic UART Service, name `Firmata-ESP32` |
-| USB serial | 115200. Boots as the log console; the **first byte** a host sends claims the Firmata session and silences logging. No disconnect event — the claim lasts until eviction or reboot. |
+| USB serial | 115200. Boots as the log console; the **first byte** a host sends claims the Firmata session and silences logging. |
 
 One master at a time, latest wins; the evicted client gets an `EVICTED` string
-notice. Scheduler tasks keep running across disconnects. The firmware report
-names it `swiftFirmataESP32` (the C++ twin reports `FirmataESP32`).
+notice. Scheduler tasks keep running across disconnects. The firmware reports its
+name as `swiftFirmataESP32` (the C++ twin reports `FirmataESP32`).
 
 ## Building from source
 
 Swift has no official Xtensa backend, so this uses a **custom toolchain**:
-Espressif's Xtensa LLVM backend grafted into Apple's `llvm-project`, with
-`swiftc` built against it.
-
-Set it up following [georgik/swift-xtensa](https://github.com/georgik/swift-xtensa)
-(one-time build, a few hours → a `swiftc` that targets `xtensa-esp32-none-elf`).
-The hard parts the toolchain build covers: the Clang/LLVM Xtensa **datalayout
-mismatch**, forcing the **static relocation model** (Xtensa rejects PIC), and
-the Embedded-Swift unicode stubs. The resulting `swiftc` is IDF-independent —
-it emits a plain Xtensa `.o` that links with any IDF.
+Espressif's Xtensa LLVM backend grafted into Apple's `llvm-project`, with `swiftc`
+built against it. Set it up following
+[georgik/swift-xtensa](https://github.com/georgik/swift-xtensa) (a one-time build
+producing a `swiftc` that targets `xtensa-esp32-none-elf`). The resulting compiler
+is IDF-independent — it emits a plain Xtensa `.o` that links with any IDF.
 
 Then the usual IDF flow (5.3.2 + the `espressif__arduino-esp32` managed component):
 
@@ -70,10 +65,10 @@ idf.py -p /dev/cu.usbserial-XXXX flash monitor
 
 ## Architecture
 
-| Layer | File |
+| Layer | File(s) |
 |---|---|
-| Firmata parser, pin/query handlers, Scheduler + logic extension, transport arbitration | `main/Main.swift` (Embedded Swift) |
-| Arduino HAL, Wi-Fi/mDNS/TCP, BLE NUS, HTTP(S), I²C, NVS, crypto | `main/firmata_shim.cpp` (C++) |
+| Firmata parser, pin/query handlers, scheduler + task extension, modules, transport arbitration | `main/*.swift` (Embedded Swift — `Main`, `Scheduler`, `FirmataProtocol`, `Modules`, `IRModule`, `RuntimeState`, `Session`, …) |
+| Arduino HAL: Wi-Fi/mDNS/TCP, BLE NUS, HTTP(S), I²C, NVS, crypto | `main/firmata_shim.cpp` (C++) |
 | Swift-runtime `__atomic_*` stubs | `main/atomic_stubs.c` |
 
 Swift calls the shim through `fm_*` functions declared in `main/BridgingHeader.h`;
@@ -81,30 +76,29 @@ C calls Swift through `sw_*` entry points. Swift owns the run loop.
 
 ## The task extension
 
-Stored tasks make decisions on the board with nobody connected. The extension
-rides under the standard Scheduler's reserved `EXTENDED_SCHEDULER_COMMAND`
-(`0x7F`), so a stock Firmata scheduler ignores it gracefully. Highlights:
+Stored tasks make decisions on the board with nobody connected. The extension rides
+under the standard scheduler's reserved `EXTENDED_SCHEDULER_COMMAND` (`0x7F`), so a
+stock Firmata scheduler ignores it. Features:
 
-- 16 global `Int32` registers `R0–R15` + 8 floats `F0–F7`
+- 32 global `Int32` registers + 16 floats — `R0–R15`/`F0–F7` public, `R16–R31`/`F8–F15` internal (auto-allocated destinations)
 - forward-only `if`/`else` (a task can branch but never hang the board)
-- int/float arithmetic, comparisons with float promotion
+- a native counted **loop** (nestable 4 deep) — runs a block exactly N times
+- int/float arithmetic and comparisons with float promotion
 - HTTP(S) from the task; JSON/string inspection over the retained body
 - a 12-slot snapshot pool (2 JSON + 10 strings) that survives later requests
 - I²C register reads into registers; `sendString` telemetry to the host
-- **nested tasks** — a task body may contain scheduler `CREATE/ADD/SCHEDULE/DELETE`
-  messages (the client records these for you), so tasks spawn and stop tasks
+- **nested tasks** — a task body may contain scheduler `CREATE/ADD/SCHEDULE/DELETE`, so tasks spawn and stop tasks
 
-Use it from Swift via `SwiftFirmataClient`'s `uploadTask { board in … }` — see
-that repo's [COOKBOOK](https://github.com/doraorak/SwiftFirmataClient/blob/main/COOKBOOK.md)
-for a recipe per feature. The wire format below is the protocol reference for
-other implementations.
+Drive it from Swift via `SwiftFirmataClient`'s `uploadTask { board in … }` — see that
+repo's [COOKBOOK](https://github.com/doraorak/SwiftFirmataClient/blob/main/COOKBOOK.md).
+The wire format below is the reference for other implementations.
 
 ## Wire format (ext ops)
 
 SysEx embedded in a task's data, under `SCHEDULER_DATA` (`0x7B`) →
-`EXTENDED_SCHEDULER_COMMAND` (`0x7F`). `<const>` is an Int32 as 5 Encoder7Bit
-bytes; `<skip>`/`<len>` are 14-bit little-endian 7-bit pairs; `<path>`/`<str>`/
-`<url>`/`<body>` are 7-bit ASCII.
+`EXTENDED_SCHEDULER_COMMAND` (`0x7F`). `<const>` is an Int32 as 5 Encoder7Bit bytes;
+`<skip>`/`<len>`/`<count>`/`<gap>` are 14-bit little-endian 7-bit pairs;
+`<path>`/`<str>`/`<url>`/`<body>` are 7-bit ASCII.
 
 ```
 SET            F0 7B 7F 10 <reg> <const:5>                          F7  // R[reg] = const
@@ -141,64 +135,71 @@ STR_COPY_SLOT  F0 7B 7F 2E <dst> <src>                                  F7  // c
 I2C_READ       F0 7B 7F 2F <addr> <regLo> <regHi> <count> <dst>         F7  // 1–4 bytes -> R[dst] (BE)
 EMIT_STRING    F0 7B 7F 30 <lenLo> <lenHi> <bytes…>                     F7  // task -> host STRING_DATA
 REG_QUERY      F0 7B 7F 31                                             F7  // reply with all registers
-REG_REPLY      F0 7B 0C <16×5B ints> <8×5B float bits>                  F7  // device -> host snapshot
+WRITE_PIN      F0 7B 7F 32 <kind> <pin> <operand>                       F7  // kind 0=digital, 1=analog/servo (by pin mode)
+MODULE_OP      F0 7B 7F 33 <id> <payload…>                             F7  // task drives module <id>
+LOOP           F0 7B 7F 34 <count:2> <gap:2> <skip:2>                   F7  // repeat body count×, gap ms between; skip if 0
+LOOP_END       F0 7B 7F 35                                             F7  // back-edge to the matching LOOP
+REG_REPLY      F0 7B 0C <32×5B ints> <16×5B float bits>                 F7  // device -> host snapshot
 HTTP_REPLY     F0 7B 0B <status:2> <body 14-bit pairs…>                 F7  // device -> host
 ```
 
-- `<reg>`: int register `0–15` (bools are 0/1 in the same bank); `<fdst>`: float register `0–7`.
+- `<reg>`: int register `0–31` (bools are 0/1 in the same bank); `<fdst>`: float
+  register `0–15`. `0–15` / `0–7` are the public banks; `16–31` / `8–15` are internal
+  (where value-producing ops auto-allocate their results).
 - `<op>`: `0 ==` `1 !=` `2 <` `3 >` `4 <=` `5 >=`.
-- `<operand>`: type byte + data — `00 <reg>` int register, `01 <const:5>` int
-  literal, `02 <freg>` float register, `03 <const:5>` float literal (IEEE 754
-  bits). If either side is float, the op promotes to float.
+- `<operand>`: type byte + data — `00 <reg>` int register, `01 <const:5>` int literal,
+  `02 <freg>` float register, `03 <const:5>` float literal (IEEE 754 bits). If either
+  side is float, the op promotes to float.
 - `<channel>` is an analog channel index (A0 = 0…), **not** a GPIO number.
-- `if/else` compiles to `[IF skip=thenLen] [then…] [SKIP skip=elseLen] [else…]` —
-  forward-only.
-- `HTTP`: `<method>` `0`=GET `1`=POST (`Content-Type: application/json`). Stores
-  the status in `R[statusReg]` (`0` on failure) and retains the body (~4 KB cap
-  for host echo; inspection walks the full body in place).
+- `if/else` compiles to `[IF skip=thenLen] [then…] [SKIP skip=elseLen] [else…]` — forward-only.
+- `loop` compiles to `[LOOP count gap skip=bodyLen] [body…] [LOOP_END]`; `LOOP_END`
+  jumps back and suspends `gap` ms between iterations; `count 0` skips the body via
+  `skip`. Nests up to 4 deep.
+- `HTTP`: `<method>` `0`=GET `1`=POST (`Content-Type: application/json`). Stores the
+  status in `R[statusReg]` (`0` on failure) and retains the body (~4 KB cap for host
+  echo; inspection walks the full body in place).
 - Inspection sources: `SELECT 0` = live body (marked **stale** when
-  `bodyGen != R[expGenReg]`), `k` = snapshot slot `k-1`. The pool has **12
-  slots** — JSON snapshots use `0–1`, strings `2–11` (the client's
-  `TaskStringSlot(n)` maps to `n+2`). `LAST_STATUS` codes: `0` ok, `1` notFound,
+  `bodyGen != R[expGenReg]`), `k` = snapshot slot `k-1`. The pool has **12 slots** —
+  JSON snapshots use `0–1`, strings `2–11`. `LAST_STATUS` codes: `0` ok, `1` notFound,
   `2` stale, `3` typeMismatch, `4` tooBig, `5` allocFailed.
 - `JSON_NUM`: value at dotted/indexed `<path>` (`result[0].pct`) × 10^`<scale>`,
   truncated; parses quoted numbers; `R[found]` = 1/0.
-- Arithmetic uses 64-bit intermediates; `÷0` and `%0` yield `0`. `STR_TO_NUM`
-  clamps to Int32.
+- Arithmetic uses 64-bit intermediates; `÷0` and `%0` yield `0`. `STR_TO_NUM` clamps to Int32.
 - **Nested tasks**: task bytes may themselves contain base scheduler messages
-  (`CREATE 0x00` / `ADD 0x02` / `SCHEDULE 0x04` / `DELETE 0x01`) — they are
-  dispatched by the replay handler like host traffic. `CREATE` never hands out
-  the slot currently being replayed, so a task cannot replace itself mid-run.
+  (`CREATE 0x00` / `ADD 0x02` / `SCHEDULE 0x04` / `DELETE 0x01`), dispatched like host
+  traffic. `CREATE` never hands out the slot currently being replayed, so a task can't
+  replace itself mid-run.
 - `REG_QUERY`/`REG_REPLY`: each value is 5 little-endian 7-bit limbs (ints as
-  two's-complement bit patterns, floats as IEEE 754 bits). Works live — the host
-  polls shared state — or from inside a task.
-- **Servo** (2.8+): `SERVO_CONFIG` (`F0 70 <pin> <minLo minHi> <maxLo maxHi> F7`)
-  sets the pulse range and enters servo mode; `setPinMode 0x04` uses the
-  544–2400 µs default. Analog/extended-analog writes to a servo pin mean
-  degrees when `< 544`, pulse µs otherwise (LEDC, 50 Hz / 14-bit).
-- Base Scheduler messages and limits: 8 task slots, 512 bytes/task, ids 0–127;
-  a one-shot removes itself; a trailing `DELAY` loops the task.
+  two's-complement bit patterns, floats as IEEE 754 bits). Works live or from a task.
+- **Servo**: `SERVO_CONFIG` (`F0 70 <pin> <minLo minHi> <maxLo maxHi> F7`) sets the
+  pulse range and enters servo mode; `setPinMode 0x04` uses the 544–2400 µs default.
+  Writes to a servo pin mean degrees when `< 544`, pulse µs otherwise (LEDC, 50 Hz).
+- Base scheduler limits: 8 task slots, 512 bytes/task, ids 0–127; a one-shot removes
+  itself; a trailing `DELAY` loops the task.
 
-## Modules (2.9+)
+## Modules
 
-Compile-time plugins behind one reserved SysEx, **`MODULE_DATA` (`0x0D`)**, each written
-in the firmware's own language — native Swift here (not forced C++). Wire:
+Compile-time plugins behind one reserved SysEx, **`MODULE_DATA` (`0x0D`)**, each
+written in the firmware's own language — native Swift here. Wire:
 
 - `F0 0D 00 F7` — **query**; reply `F0 0D 7F <n> [<id> <maj> <min> <nameLen> <name…>]* F7`.
-- `F0 0D <id> <payload…> F7` — talk to module `<id>` (any `0x01–0x7E`); the payload is that
+- `F0 0D <id> <payload…> F7` — talk to module `<id>` (`0x01–0x7E`); the payload is that
   module's own protocol, both directions (modules push events the same way).
 - Task ext op `0x33 <id> <payload…>` — a scheduled task drives a module.
 
-The registry is a static `moduleTable` (id, version, name) + a dispatch switch + a per-loop
-`moduleTick()`; adding a module = one table row, a handler, and a tick.
+Each module is a `final class` conforming to `ModuleHandler` (its `id`/version/`name`,
+a `handle(_:_:)` for its wire ops, and a `tick()`); a `modules` array is the registry
+that discovery, dispatch, and the per-loop tick all iterate. Adding a module is one
+class plus one array entry.
 
-| ID | Module | Ver | Purpose |
-|----|--------|-----|---------|
-| `0x01` | `ir` | 1.0 | Infrared NEC/RC6 transmit + NEC receive over RMT |
+| ID | Module | Purpose |
+|----|--------|---------|
+| `0x01` | `ir` | Infrared NEC/RC6 transmit + NEC receive over RMT |
 
-The IR module transmits any protocol via one raw op (`0x03 <kHz> <mark/space µs pairs>`); the
-host encodes NEC/RC6 (see [SwiftFirmataIR](https://github.com/doraorak/SwiftFirmataIR)). Drive
-the LED at 5 V, keep the receiver on 3.3 V.
+The IR module transmits any protocol via one raw op (`0x03 <kHz> <mark/space µs pairs>`),
+with NEC/RC6 encoded host-side (see [SwiftFirmataIR](https://github.com/doraorak/SwiftFirmataIR));
+it also carries on-device NEC/RC6 encoders (`0x05 <protocol> <reg>`) to replay a code
+held in a register. Drive the LED at 5 V, keep the receiver on 3.3 V.
 
 ## Pin map (ESP32)
 
@@ -207,9 +208,9 @@ the LED at 5 V, keep the receiver on 3.3 V.
 
 ## Troubleshooting
 
-IDF 5.3.2 on Python 3.9: `check_python_dependencies.py` can spuriously fail on
-dotted dist names (`ruamel.yaml`) — `pip install importlib_metadata` into the
-IDF venv and pin `setuptools<81`.
+IDF 5.3.2 on Python 3.9: `check_python_dependencies.py` can spuriously fail on dotted
+dist names (`ruamel.yaml`) — `pip install importlib_metadata` into the IDF venv and
+pin `setuptools<81`.
 
 ## License
 
