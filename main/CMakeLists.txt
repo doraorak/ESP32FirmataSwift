@@ -40,7 +40,24 @@ if(SWIFTC STREQUAL "")
 endif()
 message(STATUS "Embedded Swift Firmata port: ${SWIFTC}  ->  ${SWIFT_TARGET_TRIPLE}")
 
-set(SWIFT_OBJ "${CMAKE_CURRENT_BINARY_DIR}/Main.swift.o")
+# Embedded Swift firmware sources. Compiled together as a single module (-wmo),
+# so declaration order between files is irrelevant. Keep this list in sync with
+# the .swift files in this directory.
+set(SWIFT_SRCS
+    "${CMAKE_CURRENT_SOURCE_DIR}/FirmataProtocol.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/RuntimeState.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Messaging.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/LiveProtocol.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Encoder7Bit.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Scheduler.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Modules.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/IRModule.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Session.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Configuration.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Transport.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Main.swift")
+
+set(SWIFT_OBJ "${CMAKE_CURRENT_BINARY_DIR}/firmata.swift.o")
 add_custom_command(
     OUTPUT  "${SWIFT_OBJ}"
     COMMAND "${SWIFTC}"
@@ -51,11 +68,11 @@ add_custom_command(
             -Xfrontend -function-sections
             -Xcc -fno-pic -Xcc -fno-pie
             -import-objc-header "${CMAKE_CURRENT_SOURCE_DIR}/BridgingHeader.h"
-            -c "${CMAKE_CURRENT_SOURCE_DIR}/Main.swift"
+            -c ${SWIFT_SRCS}
             -o "${SWIFT_OBJ}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Main.swift"
+    DEPENDS ${SWIFT_SRCS}
             "${CMAKE_CURRENT_SOURCE_DIR}/BridgingHeader.h"
-    COMMENT "Compiling Main.swift -> ${SWIFT_TARGET_TRIPLE} (Embedded Swift Firmata)"
+    COMMENT "Compiling Embedded Swift Firmata (${SWIFT_TARGET_TRIPLE})"
     VERBATIM)
 
 set_source_files_properties("${SWIFT_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
