@@ -32,10 +32,20 @@ int32_t       fm_serial_available(void);
 int32_t       fm_serial_read(void);
 void          fm_serial_write(const uint8_t *b, int32_t n);
 void          fm_analog_setup(void);
-void          fm_pin_mode(int pin, int mode);        // 0=INPUT 1=OUTPUT 2=INPUT_PULLUP
+void          fm_pin_mode(int pin, int mode);        // 0=INPUT 1=OUTPUT 2=INPUT_PULLUP 3=INPUT_PULLDOWN
 unsigned int  fm_millis(void);
 void          fm_delay_ms(unsigned int ms);
 void          fm_delay_us(unsigned int us);
+
+// --- ESP32 pin-mode extensions (touch / DAC / LEDC config) ---
+int32_t       fm_touch_read(int32_t pin);                            // raw touch counts (lower = touched)
+void          fm_dac_write(int32_t pin, int32_t value);              // true analog out, 0-255 (GPIO 25/26)
+void          fm_ledc_config(int32_t pin, int32_t freq_hz, int32_t res_bits); // per-pin PWM freq/resolution
+void          fm_pwm_write(int32_t pin, int32_t duty);              // duty write (IDF channel for PWM_CONFIG pins)
+
+// --- Module hardware primitives (sonar / DHT) ---
+int32_t       fm_sonar_ping_us(int32_t trig, int32_t echo, int32_t timeout_us); // echo pulse width us, 0 = timeout
+int32_t       fm_dht_read(int32_t pin, int32_t type, float *temp_c, float *hum_pct); // 0 ok, -1 fail; type 0=DHT11 1=DHT22
 
 // --- I2C (Wire) ---
 void fm_i2c_begin(int sda, int scl);

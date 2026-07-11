@@ -26,6 +26,13 @@ final class FirmataProtocol {
     pinValues[pin] = Int(us)
   }
 
+  /* True analog out (8-bit DAC, GPIO 25/26). */
+  func dacOut(_ pin: Int, _ value: Int) {
+    let v = value < 0 ? 0 : (value > 255 ? 255 : value)
+    fm_dac_write(Int32(pin), Int32(v))
+    pinValues[pin] = v
+  }
+
   func handleSetPinMode(_ pin: Int, _ mode: UInt8) {
     if pin >= TOTAL_PINS { return }
     if pinModes[pin] == PIN_MODE_SERVO && mode != PIN_MODE_SERVO { fm_servo_detach(Int32(pin)) }
@@ -47,9 +54,35 @@ final class FirmataProtocol {
       }
     case PIN_MODE_I2C:
       pinModes[pin] = mode
+    case PIN_MODE_PULLDOWN:
+      // Internal pull-down — full-digital pins only (GPIO 34–39 have no pull resistors).
+      if isFullDigital(pin) { fm_pin_mode(Int32(pin), 3); pinModes[pin] = mode; pinValues[pin] = 0; pinConfigured[pin] = true }
+    case PIN_MODE_TOUCH:
+      // Capacitive touch — the sensor then reads via its analog channel (6–15), like ANALOG.
+      if touchSensorOfPin(pin) >= 0 { pinModes[pin] = mode }
+    case PIN_MODE_DAC:
+      if isDACPin(pin) { pinModes[pin] = mode; dacOut(pin, 0) }
     default:
       break
     }
+  }
+
+  /* PWM_CONFIG (0x0E): pin, frequency Hz (3 × 7-bit LE, up to ~2 MHz), duty resolution
+     in bits (1–14). Applies the LEDC config and puts the pin in PWM mode (mirrors
+     SERVO_CONFIG's set-the-mode behaviour). On a passive buzzer the frequency IS the tone. */
+  func handlePwmConfig(_ data: [UInt8], _ len: Int) {
+    if len < 5 { return }
+    let pin = Int(data[0])
+    if pin >= TOTAL_PINS || !isFullDigital(pin) { return }
+    let freq = Int32(data[1] & 0x7F) | (Int32(data[2] & 0x7F) << 7) | (Int32(data[3] & 0x7F) << 14)
+    var res = Int(data[4] & 0x7F)
+    if res < 1 { res = 1 }; if res > 14 { res = 14 }
+    if freq <= 0 { return }
+    fm_ledc_config(Int32(pin), freq, Int32(res))
+    pwmMaxDuty[pin] = (1 << res) - 1
+    pinModes[pin] = PIN_MODE_PWM
+    pinValues[pin] = 0
+    pinConfigured[pin] = true
   }
 
   /* SERVO_CONFIG (0x70): pin, minPulse (14-bit LE), maxPulse (14-bit LE). Sets the
@@ -90,6 +123,7 @@ final class FirmataProtocol {
     let value = Int(lsb & 0x7F) | (Int(msb & 0x7F) << 7)
     if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
     else if pinModes[pin] == PIN_MODE_SERVO { servoOut(pin, value) }
+    else if pinModes[pin] == PIN_MODE_DAC { dacOut(pin, value) }
   }
 
   func handleReportAnalog(_ channel: Int, _ enable: UInt8) {
@@ -127,6 +161,7 @@ final class FirmataProtocol {
     for i in 1..<len { value |= Int(data[i] & 0x7F) << (7 * (i - 1)) }
     if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
     else if pinModes[pin] == PIN_MODE_SERVO { servoOut(pin, value) }
+    else if pinModes[pin] == PIN_MODE_DAC { dacOut(pin, value) }
   }
 
   func handleI2CConfig(_ data: [UInt8], _ len: Int) {
@@ -211,6 +246,7 @@ final class FirmataProtocol {
       }
     case STRING_DATA:          handleString(data, dlen)
     case SERVO_CONFIG:         handleServoConfig(data, dlen)
+    case PWM_CONFIG:           handlePwmConfig(data, dlen)
     case I2C_CONFIG:           handleI2CConfig(data, dlen)
     case I2C_REQUEST:          handleI2CRequest(data, dlen)
     case SCHEDULER_DATA:       sched.handleSysex(data, dlen)

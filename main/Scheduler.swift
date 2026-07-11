@@ -70,6 +70,7 @@ final class Scheduler {
     guard let t = find(id) else { sendError(id); return }
     t.pos = 0
     t.loopDepth = 0
+    t.onceMask = 0
     t.time_ms = fm_millis() &+ delayMs
     if t.time_ms == 0 { t.time_ms = 1 }
   }
@@ -202,10 +203,17 @@ final class Scheduler {
       if payloadLen == 7 { regs[Int(payload[1] & REG_MASK)] = Int32(bitPattern: sched7BitTime(Array(payload[2..<7]))) }
     case SCHED_EXT_READ_DIGITAL:        // 0x11 reg pin
       if payloadLen == 3 { regs[Int(payload[1] & REG_MASK)] = (digitalRead(payload[2]) != 0) ? 1 : 0 }
-    case SCHED_EXT_READ_ANALOG:         // 0x12 reg channel
+    case SCHED_EXT_READ_ANALOG:         // 0x12 reg channel (0–5 ADC, 6–15 touch)
       if payloadLen == 3 {
-        let pin = pinOfAnalogChannel(Int(payload[2]))
-        regs[Int(payload[1] & REG_MASK)] = (pin >= 0) ? Int32(analogRead(UInt8(pin))) : 0
+        let ch = Int(payload[2])
+        if ch >= TOUCH_CHANNEL_BASE {
+          let pin = pinOfTouchChannel(ch)
+          regs[Int(payload[1] & REG_MASK)] =
+            (pin >= 0 && pinModes[pin] == PIN_MODE_TOUCH) ? Int32(fm_touch_read(Int32(pin))) : 0
+        } else {
+          let pin = pinOfAnalogChannel(ch)
+          regs[Int(payload[1] & REG_MASK)] = (pin >= 0) ? Int32(analogRead(UInt8(pin))) : 0
+        }
       }
     case SCHED_EXT_IF:                  // 0x13 op <operandA> <operandB> skipLo skipHi
       var i = 1
@@ -288,6 +296,38 @@ final class Scheduler {
       }
     case SCHED_EXT_LOOP_END:         // 0x35
       loopEnd()
+    case SCHED_EXT_PWM_FREQ:         // 0x36 pin <operand> — retune from a runtime value (8-bit duty)
+      if payloadLen >= 4 {
+        let pin = Int(payload[1] & 0x7F)
+        if pin < TOTAL_PINS && isFullDigital(pin) {
+          var i = 2
+          let v = readOperand(payload, payloadLen, &i)
+          var freq = v.isFloat ? f2i(v.f) : v.i
+          if freq < 1 { freq = 1 }
+          if freq > 0x1F_FFFF { freq = 0x1F_FFFF }
+          fm_ledc_config(Int32(pin), freq, 8)
+          pwmMaxDuty[pin] = 255
+          pinModes[pin] = PIN_MODE_PWM
+          pinConfigured[pin] = true
+        }
+      }
+    case SCHED_EXT_DELAY_OP:         // 0x37 <operand> — delay ms from a runtime value
+      if payloadLen >= 3 {
+        var i = 1
+        let v = readOperand(payload, payloadLen, &i)
+        let ms = v.isFloat ? f2i(v.f) : v.i
+        if ms > 0 { delayRunning(UInt32(ms)) }
+      }
+    case SCHED_EXT_ONCE:             // 0x38 idx skipLo skipHi — run body on first pass only
+      if payloadLen == 4, let t = running {
+        let idx = Int(payload[1] & 0x1F)
+        let skipLen = UInt16(payload[2] & 0x7F) | (UInt16(payload[3] & 0x7F) << 7)
+        if (t.onceMask & (UInt32(1) << idx)) != 0 {
+          skip(skipLen)                       // already ran: jump over the body
+        } else {
+          t.onceMask |= (UInt32(1) << idx)    // first pass: mark and fall through
+        }
+      }
     default:
       break
     }
@@ -335,11 +375,12 @@ final class Scheduler {
     } else {
       if pinModes[pin] == PIN_MODE_PWM { pwm(pin, value); pinValues[pin] = value }
       else if pinModes[pin] == PIN_MODE_SERVO { replay.servoOut(pin, value) }
+      else if pinModes[pin] == PIN_MODE_DAC { replay.dacOut(pin, value) }
     }
   }
 
   /* 0x31: report every register to the connected host as SCHED_REG_REPLY —
-     16 Int32s then 8 float bit-patterns, each as 5 little-endian 7-bit limbs.
+     32 Int32s then 16 float bit-patterns, each as 5 little-endian 7-bit limbs.
      Works live (host polls shared state) or from inside a task. */
   func regReport() {
     var n = 0

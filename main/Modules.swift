@@ -22,11 +22,19 @@ func checkDigitalInputs() {
   }
 }
 
-// Emit analog reports for enabled channels, then service continuous I2C reads.
+// Emit analog reports for enabled channels — ADC on 0–5, touch sensors on 6–15 —
+// then service continuous I2C reads.
 func sampleAnalogAndI2C() {
-  for channel in 0..<NUM_ANALOG where (analogReportMask & (UInt16(1) << channel)) != 0 {
-    let pin = pinOfAnalogChannel(channel)
-    if pin >= 0 { sendAnalogReport(channel, Int(analogRead(UInt8(pin)))) }
+  for channel in 0..<16 where (analogReportMask & (UInt16(1) << channel)) != 0 {
+    if channel < NUM_ANALOG {
+      let pin = pinOfAnalogChannel(channel)
+      if pin >= 0 { sendAnalogReport(channel, Int(analogRead(UInt8(pin)))) }
+    } else {
+      let pin = pinOfTouchChannel(channel)
+      if pin >= 0 && pinModes[pin] == PIN_MODE_TOUCH {
+        sendAnalogReport(channel, Int(fm_touch_read(Int32(pin))))
+      }
+    }
   }
   for index in 0..<MAX_CONT_READS where contReads[index].active {
     i2cRead(contReads[index].address, contReads[index].reg, contReads[index].count)
@@ -54,7 +62,12 @@ protocol ModuleHandler: AnyObject {
 }
 
 /* Every compiled-in module, in one place. */
-let modules: [ModuleHandler] = [IRModuleHandler()]
+let modules: [ModuleHandler] = [
+  IRModuleHandler(),
+  SonarModuleHandler(),
+  DHTModuleHandler(),
+  DisplayModuleHandler(),
+]
 
 func moduleDispatch(_ id: UInt8, _ payload: [UInt8], _ count: Int) {
   for module in modules where module.id == id { module.handle(payload, count); return }

@@ -30,6 +30,10 @@ final class SchedTask {
   var loopRemaining = [UInt16](repeating: 0, count: MAX_LOOP_DEPTH)
   var loopGap       = [UInt32](repeating: 0, count: MAX_LOOP_DEPTH)
   var loopResume    = [UInt16](repeating: 0, count: MAX_LOOP_DEPTH)
+  /* `once { }` guards already taken this task lifetime (bit = ONCE idx). Cleared on
+     (re)schedule only — NOT on the trailing-delay wraparound, so a repeatEvery task
+     runs each once-block exactly once until re-uploaded. */
+  var onceMask: UInt32 = 0
 }
 
 /* ==== Runtime pin / reporting state ===================================== */
@@ -37,6 +41,8 @@ var pinModes      = [UInt8](repeating: PIN_MODE_INPUT, count: TOTAL_PINS)
 /* Servo pulse range per pin (SERVO_CONFIG overrides the 544-2400 us defaults). */
 var servoMinUs    = [Int32](repeating: 544, count: TOTAL_PINS)
 var servoMaxUs    = [Int32](repeating: 2400, count: TOTAL_PINS)
+/* Max PWM duty per pin: (1 << resolutionBits) - 1. Default 8-bit; PWM_CONFIG overrides. */
+var pwmMaxDuty    = [Int](repeating: 255, count: TOTAL_PINS)
 var pinValues     = [Int](repeating: 0, count: TOTAL_PINS)
 var pinConfigured = [Bool](repeating: false, count: TOTAL_PINS)
 var analogReportMask: UInt16 = 0
@@ -77,8 +83,10 @@ let TR_BLE: UInt8    = 2
 let TR_SERIAL: UInt8 = 3
 var activeTransport: UInt8 = TR_NONE
 
-/* ==== PWM -> Arduino analogWrite (LEDC). Firmata duty is 8-bit (0..255). ==== */
+/* ==== PWM -> Arduino analogWrite (LEDC). Duty clamps to the pin's configured
+   resolution — 8-bit (0..255) by default, PWM_CONFIG can raise it to 14-bit. ==== */
 @inline(__always) func pwm(_ pin: Int, _ value: Int) {
-  let v = value < 0 ? 0 : (value > 255 ? 255 : value)
-  analogWrite(UInt8(pin), Int32(v))
+  let hi = pwmMaxDuty[pin]
+  let v = value < 0 ? 0 : (value > hi ? hi : value)
+  fm_pwm_write(Int32(pin), Int32(v))   // routes PWM_CONFIG pins to their IDF channel
 }

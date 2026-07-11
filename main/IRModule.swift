@@ -5,21 +5,30 @@
    routes MODULE_DATA(0x0D)/MODULE_OP(0x33) payloads for id 0x01 to `handle`, and calls
    `tick` each main-loop iteration. Ops:
      0x00 <pin>              configure the TX pin (carrier is per-send)
-     0x02 <pin> <dstReg>     start RX; each decoded NEC frame → R[dstReg], event 0x03
+     0x02 <pin> <dstReg> [<protocol>]  start RX; each decoded frame → R[dstReg], event 0x03.
+                             protocol 0 = NEC (default, omitted byte = old wire form),
+                             1 = RC6 mode 0, 2 = Coolix (Midea AC family, 24-bit).
+                             All three decode the SAME raw RMT capture the sniffer sees.
      0x03 <kHz> <durations>  raw send (host-encoded NEC/RC6/any protocol)
      0x04 …                  repeat/hold send (frame A / optional toggle frame B)
-     0x05 <protocol> <srcReg> encode a code held in a register on-device (NEC/RC6) and send */
+     0x05 <protocol> <srcReg> encode a code held in a register on-device (NEC/RC6) and send
+     0x06 <pin> <enable>     raw capture: push EVERY received burst as event 0x07
+                             <totalLo> <totalHi> <durations, 14-bit LE pairs> — protocol
+                             sniffing for remotes the NEC decoder can't read (AC units etc.) */
 final class IRModuleHandler: ModuleHandler {
   let id: UInt8 = 0x01
   let major: UInt8 = 1
-  let minor: UInt8 = 0
+  let minor: UInt8 = 2
   let name: StaticString = "ir"
 
   var txPin: Int32 = -1
   var rxPin: Int32 = -1
   var dstReg = 0
-  var rxBuf = [Int32](repeating: 0, count: 192)    // reused; no per-tick allocation
-  var rawBuf = [Int32](repeating: 0, count: 160)   // reused; staged send durations (op 0x03/0x04/0x05)
+  var rxProtocol: UInt8 = 0                         // 0 NEC, 1 RC6, 2 Coolix
+  var rawReport = false                             // op 0x06: mirror captures to the host
+  var rxBuf = [Int32](repeating: 0, count: 256)    // reused; no per-tick allocation
+  var rawBuf = [Int32](repeating: 0, count: 224)   // staged send durations — sized for a
+                                                    // doubled Coolix message (199)
   var txCount = 0                                   // total durations staged (frame A, then optional B)
   var txNA = 0                                      // durations in frame A; B = [txNA..<txCount]
   var txSendIdx = 0                                 // send # in a repeat run (even=A, odd=B: RC6 toggle)
@@ -85,6 +94,33 @@ final class IRModuleHandler: ModuleHandler {
     return count
   }
 
+  /// Coolix (Midea AC family), 38 kHz: 4692/4416 µs header, 552 µs marks, space 1656 = 1 /
+  /// 552 = 0. The 24-bit code goes out as byte+complement pairs (48 wire bits), and the
+  /// whole message is sent twice — real Coolix remotes always double it.
+  func encodeCoolix(_ code: UInt32) -> Int {
+    var count = 0
+    func put(_ duration: Int32) { if count < rawBuf.count { rawBuf[count] = duration; count += 1 } }
+    func section() {
+      put(4692); put(4416)
+      var byteIndex = 2
+      while byteIndex >= 0 {
+        let byte = (code >> UInt32(byteIndex * 8)) & 0xFF
+        for value in [byte, ~byte & 0xFF] {
+          var bit = 7
+          while bit >= 0 {
+            put(552)
+            put(((value >> UInt32(bit)) & 1) == 1 ? 1656 : 552)
+            bit -= 1
+          }
+        }
+        byteIndex -= 1
+      }
+      put(552)                                              // footer mark
+    }
+    section(); put(5244); section()                         // message + gap + repeat
+    return count
+  }
+
   func encodeRC6(_ data: UInt32, bits: Int) -> Int {
     let t: Int32 = 444
     var count = 0
@@ -117,6 +153,7 @@ final class IRModuleHandler: ModuleHandler {
       if length >= 3 && fm_rmt_rx_init(Int32(payload[1] & 0x7F)) != 0 {
         rxPin = Int32(payload[1] & 0x7F)
         dstReg = Int(payload[2] & REG_MASK)
+        rxProtocol = length >= 4 ? payload[3] & 0x7F : 0
       }
     case 0x03:
       // Raw send: <carrierKHz> <duration pairs as 14-bit LE>. Marks HIGH; carrierKHz 0 = no
@@ -147,15 +184,31 @@ final class IRModuleHandler: ModuleHandler {
       }
     case 0x05:
       // Encode + send a numeric code held in a register: <protocol> <srcReg>. protocol 0 = NEC
-      // (38 kHz), 1 = RC6 (36 kHz). Lets a task replay a received/computed code the host can't pre-encode.
+      // (38 kHz), 1 = RC6 (36 kHz), 2 = Coolix (38 kHz). Lets a task replay a received/computed
+      // code the host can't pre-encode.
       if length >= 3 && txPin >= 0 {
         let proto = payload[1] & 0x7F
         let code = UInt32(bitPattern: scheduler.regs[Int(payload[2] & REG_MASK)])
         _ = fm_rmt_tx_carrier(txPin, 0, 33, (proto == 1 ? 36 : 38) * 1000)
         txRepeatLeft = 0
-        txCount = proto == 1 ? encodeRC6(code, bits: 20) : encodeNEC(code)
+        if proto == 1 { txCount = encodeRC6(code, bits: 20) }
+        else if proto == 2 { txCount = encodeCoolix(code) }
+        else { txCount = encodeNEC(code) }
         txNA = txCount
         txFrame(0)
+      }
+    case 0x06:
+      // Raw capture on/off. Enabling (re)arms the receiver on <pin>; NEC decode keeps
+      // running alongside, so a known remote still lands codes while sniffing.
+      if length >= 3 {
+        if payload[2] & 0x7F != 0 {
+          if fm_rmt_rx_init(Int32(payload[1] & 0x7F)) != 0 {
+            rxPin = Int32(payload[1] & 0x7F)
+            rawReport = true
+          }
+        } else {
+          rawReport = false
+        }
       }
     #if IR_DEBUG
     case 0x7C:
@@ -203,7 +256,22 @@ final class IRModuleHandler: ModuleHandler {
   func tick() {
     txTick()
     if rxPin < 0 { return }
-    let captureCount = rxBuf.withUnsafeMutableBufferPointer { fm_rmt_rx_poll($0.baseAddress, 192) }
+    let captureCount = rxBuf.withUnsafeMutableBufferPointer { fm_rmt_rx_poll($0.baseAddress, 256) }
+    if rawReport && captureCount >= 6 {              // skip sub-3-symbol noise blips
+      var out: [UInt8] = [START_SYSEX, MODULE_DATA, id, 0x07,
+                          UInt8(Int(captureCount) & 0x7F), UInt8((Int(captureCount) >> 7) & 0x7F)]
+      var index = 0
+      while index < Int(captureCount) {
+        var duration = rxBuf[index]
+        if duration < 0 { duration = 0 }
+        if duration > 16383 { duration = 16383 }
+        out.append(UInt8(duration & 0x7F))
+        out.append(UInt8((duration >> 7) & 0x7F))
+        index += 1
+      }
+      out.append(END_SYSEX)
+      sendFrame(out, out.count)
+    }
     #if IR_DEBUG
     if captureCount > 0 {                            // stash every capture for the 0x7E dump
       captureTotal += 1
@@ -211,11 +279,31 @@ final class IRModuleHandler: ModuleHandler {
       for index in 0..<lastCaptureCount { lastCapture[index] = rxBuf[index] }
     }
     #endif
-    if captureCount < 66 { return }
-    // Find the 9 ms / 4.5 ms header, then read 32 mark/space bit pairs.
+    // All protocols decode the same raw capture the sniffer sees (op 0x02's protocol byte
+    // picks the decoder; a burst that doesn't parse is simply ignored).
+    switch rxProtocol {
+    case 1:  decodeRC6Capture(Int(captureCount))
+    case 2:  decodeCoolixCapture(Int(captureCount))
+    default: decodeNECCapture(Int(captureCount))
+    }
+  }
+
+  /// Deliver a decoded frame: destination register + event 0x03 to the host.
+  func emitReceived(_ code: UInt32) {
+    scheduler.regs[dstReg] = Int32(bitPattern: code)
+    var out: [UInt8] = [START_SYSEX, MODULE_DATA, id, 0x03]
+    var remaining = code
+    for _ in 0..<5 { out.append(UInt8(remaining & 0x7F)); remaining >>= 7 }
+    out.append(END_SYSEX)
+    sendFrame(out, out.count)
+  }
+
+  /// NEC: 9 ms / 4.5 ms header, then 32 bits of 562 µs mark + 562/1687 µs space.
+  func decodeNECCapture(_ count: Int) {
+    if count < 66 { return }
     var index = 0
-    while index + 1 < Int(captureCount) && !(near(rxBuf[index], 9000) && near(rxBuf[index + 1], 4500)) { index += 1 }
-    if index + 66 > Int(captureCount) { return }
+    while index + 1 < count && !(near(rxBuf[index], 9000) && near(rxBuf[index + 1], 4500)) { index += 1 }
+    if index + 66 > count { return }
     index += 2
     var code: UInt32 = 0
     var bitIndex = 0
@@ -227,11 +315,84 @@ final class IRModuleHandler: ModuleHandler {
       else { return }
       index += 2; bitIndex += 1
     }
-    scheduler.regs[dstReg] = Int32(bitPattern: code)
-    var out: [UInt8] = [START_SYSEX, MODULE_DATA, id, 0x03]
-    var remaining = code
-    for _ in 0..<5 { out.append(UInt8(remaining & 0x7F)); remaining >>= 7 }
-    out.append(END_SYSEX)
-    sendFrame(out, out.count)
+    emitReceived(code)
+  }
+
+  /// Coolix: ~4.5/4.4 ms header, 552 µs marks, space 1656 = 1 / 552 = 0; 48 wire bits =
+  /// three byte+complement pairs, folded to the 24-bit code after the complements check.
+  /// Real remotes double the message; the first section in the capture is enough.
+  func decodeCoolixCapture(_ count: Int) {
+    if count < 98 { return }
+    var index = 0
+    while index + 1 < count && !(near(rxBuf[index], 4550) && near(rxBuf[index + 1], 4400)) { index += 1 }
+    if index + 98 > count { return }
+    index += 2
+    var bits: UInt64 = 0
+    var bitIndex = 0
+    // Wide windows, split at 1 ms: real receivers stretch marks (up to ~750 µs seen) and
+    // shrink zero-spaces (down to ~370 µs) — the two space clusters stay far apart.
+    while bitIndex < 48 {
+      let mark = rxBuf[index], space = rxBuf[index + 1]
+      if mark < 350 || mark > 950 { return }
+      if space > 1000 && space < 2400 { bits = (bits << 1) | 1 }
+      else if space > 250 && space <= 1000 { bits = bits << 1 }
+      else { return }
+      index += 2; bitIndex += 1
+    }
+    var code: UInt32 = 0
+    var byteIndex = 0
+    while byteIndex < 3 {
+      let byte = UInt32(truncatingIfNeeded: bits >> UInt64(40 - byteIndex * 16)) & 0xFF
+      let complement = UInt32(truncatingIfNeeded: bits >> UInt64(32 - byteIndex * 16)) & 0xFF
+      if complement != (~byte & 0xFF) { return }
+      code = (code << 8) | byte
+      byteIndex += 1
+    }
+    emitReceived(code)
+  }
+
+  /// RC6 mode 0: 6t/2t leader (t = 444 µs), a `1` start bit, then Manchester bits with the
+  /// 4th one double-width (the toggle). Durations are converted to half-bit units and the
+  /// unit stream is walked bit by bit; 16–32 decoded bits (incl. mode+toggle) = a frame —
+  /// so a TV key arrives as e.g. 0x0000C or 0x1000C depending on the toggle.
+  func decodeRC6Capture(_ count: Int) {
+    let t: Int32 = 444
+    // Flatten durations into a level-per-unit stream (true = mark). A duration that
+    // doesn't round to 1..8 units ends the usable stream (idle gap / glitch).
+    var unitLevel = [Bool](repeating: false, count: 200)
+    var unitCount = 0
+    var durIndex = 0
+    while durIndex < count && unitCount < 200 {
+      let duration = rxBuf[durIndex]
+      let units = Int((duration + t / 2) / t)
+      if units < 1 || units > 8 { break }
+      let isMark = durIndex % 2 == 0
+      var k = 0
+      while k < units && unitCount < 200 { unitLevel[unitCount] = isMark; unitCount += 1; k += 1 }
+      durIndex += 1
+    }
+    // Leader: 6 mark units + 2 space units; start bit: mark, space (= 1).
+    if unitCount < 12 { return }
+    var p = 0
+    for _ in 0..<6 { if !unitLevel[p] { return }; p += 1 }
+    for _ in 0..<2 { if unitLevel[p] { return }; p += 1 }
+    if !(unitLevel[p] && !unitLevel[p + 1]) { return }
+    p += 2
+    // Manchester bits: first half mark = 1, space = 0; the 4th bit is double-width.
+    var code: UInt32 = 0
+    var bitsRead = 0
+    while bitsRead < 32 {
+      let width = (bitsRead == 3) ? 2 : 1
+      if p + 2 * width > unitCount { break }
+      var halvesValid = true
+      for k in 1..<width where unitLevel[p + k] != unitLevel[p] { halvesValid = false }
+      for k in 1..<width where unitLevel[p + width + k] != unitLevel[p + width] { halvesValid = false }
+      if !halvesValid || unitLevel[p] == unitLevel[p + width] { break }
+      code = (code << 1) | (unitLevel[p] ? 1 : 0)
+      p += 2 * width
+      bitsRead += 1
+    }
+    if bitsRead < 16 { return }
+    emitReceived(code)
   }
 }

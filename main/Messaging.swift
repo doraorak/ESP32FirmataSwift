@@ -35,11 +35,14 @@ func sendCapabilityResponse() {
     if isFullDigital(pin) {
       frameBuf[n] = PIN_MODE_INPUT;  n += 1; frameBuf[n] = 1; n += 1
       frameBuf[n] = PIN_MODE_PULLUP; n += 1; frameBuf[n] = 1; n += 1
+      frameBuf[n] = PIN_MODE_PULLDOWN; n += 1; frameBuf[n] = 1; n += 1
       frameBuf[n] = PIN_MODE_OUTPUT; n += 1; frameBuf[n] = 1; n += 1
-      frameBuf[n] = PIN_MODE_PWM;    n += 1; frameBuf[n] = 8; n += 1
+      frameBuf[n] = PIN_MODE_PWM;    n += 1; frameBuf[n] = 14; n += 1   // up to 14-bit via PWM_CONFIG
       frameBuf[n] = PIN_MODE_SERVO;  n += 1; frameBuf[n] = 14; n += 1
       if pin == I2C_SDA_PIN || pin == I2C_SCL_PIN { frameBuf[n] = PIN_MODE_I2C; n += 1; frameBuf[n] = 1; n += 1 }
       if analogChannelOfPin(pin) >= 0 { frameBuf[n] = PIN_MODE_ANALOG; n += 1; frameBuf[n] = 12; n += 1 }
+      if touchSensorOfPin(pin) >= 0 { frameBuf[n] = PIN_MODE_TOUCH; n += 1; frameBuf[n] = 14; n += 1 }
+      if isDACPin(pin) { frameBuf[n] = PIN_MODE_DAC; n += 1; frameBuf[n] = 8; n += 1 }
     } else if isInputOnly(pin) {
       frameBuf[n] = PIN_MODE_INPUT; n += 1; frameBuf[n] = 1; n += 1
       if analogChannelOfPin(pin) >= 0 { frameBuf[n] = PIN_MODE_ANALOG; n += 1; frameBuf[n] = 12; n += 1 }

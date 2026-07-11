@@ -3,7 +3,7 @@
 /* ==== Firmware identity (firmware-report message) ======================= */
 let FIRMWARE_NAME: StaticString = "swiftFirmataESP32"
 let FIRMWARE_MAJOR: UInt8 = 2
-let FIRMWARE_MINOR: UInt8 = 15
+let FIRMWARE_MINOR: UInt8 = 17
 let PROTOCOL_MAJOR: UInt8 = 2
 let PROTOCOL_MINOR: UInt8 = 8
 
@@ -37,6 +37,7 @@ let SCHEDULER_DATA: UInt8          = 0x7B
 
 // Encrypted Wi-Fi provisioning (non-standard; top-level user-range SysEx 0x0C).
 let MODULE_DATA: UInt8 = 0x0D      // module subsystem (user-range SysEx)
+let PWM_CONFIG: UInt8 = 0x0E       // per-pin LEDC freq/resolution (user-range SysEx)
 let MODULE_QUERY: UInt8 = 0x00
 let MODULE_LIST_REPLY: UInt8 = 0x7F
 let WIFI_CONFIG: UInt8 = 0x0C
@@ -104,6 +105,9 @@ let SCHED_EXT_WRITE_PIN: UInt8    = 0x32  // write a pin from an operand: kind(0
 let SCHED_EXT_MODULE_OP: UInt8    = 0x33  // deliver a payload to a module from a task
 let SCHED_EXT_LOOP: UInt8         = 0x34  // begin a counted loop: countLo countHi gapLo gapHi skipLo skipHi
 let SCHED_EXT_LOOP_END: UInt8     = 0x35  // end of a counted loop: decrement, jump back + gap, or exit
+let SCHED_EXT_PWM_FREQ: UInt8     = 0x36  // set a PWM pin's frequency from an operand (runtime value)
+let SCHED_EXT_DELAY_OP: UInt8     = 0x37  // delay milliseconds from an operand (runtime value)
+let SCHED_EXT_ONCE: UInt8         = 0x38  // once-per-task-lifetime guard: idx, skip body when already run
 
 // Result-status codes (read with SCHED_EXT_LAST_STATUS).
 let ST_OK: Int32            = 0
@@ -122,12 +126,19 @@ let PIN_MODE_PWM: UInt8    = 0x03
 let PIN_MODE_SERVO: UInt8  = 0x04
 let PIN_MODE_I2C: UInt8    = 0x06
 let PIN_MODE_PULLUP: UInt8 = 0x0B
+// ESP32 extensions (block 0x10+, clear of the standard table)
+let PIN_MODE_PULLDOWN: UInt8 = 0x10   // internal pull-down (full-digital pins only)
+let PIN_MODE_TOUCH: UInt8    = 0x11   // capacitive touch — reads via analog channels 6–15
+let PIN_MODE_DAC: UInt8      = 0x12   // true 8-bit analog out (GPIO 25/26)
 
 /* ==== ESP32 pin model =================================================== */
 let TOTAL_PINS = 40
 let NUM_PORTS  = (TOTAL_PINS + 7) / 8          // 5
 let ANALOG_PINS: [Int] = [32, 33, 34, 35, 36, 39]
 let NUM_ANALOG = 6
+/* Touch sensors T0–T9 ride the analog paths on channels 6–15 (ADC owns 0–5). */
+let TOUCH_PINS: [Int] = [4, 0, 2, 15, 13, 12, 14, 27, 33, 32]   // T0…T9
+let TOUCH_CHANNEL_BASE = 6
 let I2C_SDA_PIN = 21
 let I2C_SCL_PIN = 22
 
@@ -144,3 +155,12 @@ func analogChannelOfPin(_ pin: Int) -> Int {
   return -1
 }
 func pinOfAnalogChannel(_ ch: Int) -> Int { (ch >= 0 && ch < NUM_ANALOG) ? ANALOG_PINS[ch] : -1 }
+func touchSensorOfPin(_ pin: Int) -> Int {
+  for i in 0..<TOUCH_PINS.count where TOUCH_PINS[i] == pin { return i }
+  return -1
+}
+func pinOfTouchChannel(_ ch: Int) -> Int {
+  let t = ch - TOUCH_CHANNEL_BASE
+  return (t >= 0 && t < TOUCH_PINS.count) ? TOUCH_PINS[t] : -1
+}
+func isDACPin(_ pin: Int) -> Bool { pin == 25 || pin == 26 }

@@ -192,7 +192,7 @@ void fm_rmt_tx(int32_t pin, const int32_t *durations, int32_t count) {
   fm_tx_last = rmtWrite((int)pin, sym, n, 200) ? 1 : 0;
 }
 
-static rmt_data_t fm_rx_buf[96];
+static rmt_data_t fm_rx_buf[128];   // full 2-block capacity: 256 durations
 static size_t     fm_rx_len = 0;
 static bool       fm_rx_armed = false;
 static int        fm_rx_pin = -1;
@@ -238,8 +238,9 @@ int32_t fm_rmt_rx_poll(int32_t *out, int32_t maxCount) {
 
 /* Servo via LEDC (Arduino core 3.x API): 50 Hz, 14-bit resolution. Duty for a
    pulse of W us in a 20 ms frame = W * 2^14 / 20000. */
-void         fm_servo_attach(int32_t pin)   { ledcAttach((uint8_t)pin, 50, 14); }
-void         fm_servo_detach(int32_t pin)   { ledcDetach((uint8_t)pin); }
+extern bool fm_ledc_on[];   // defined below with fm_ledc_config
+void         fm_servo_attach(int32_t pin)   { ledcAttach((uint8_t)pin, 50, 14); fm_ledc_on[(uint8_t)pin] = true; }
+void         fm_servo_detach(int32_t pin)   { ledcDetach((uint8_t)pin); fm_ledc_on[(uint8_t)pin] = false; }
 void         fm_servo_write_us(int32_t pin, int32_t us) {
   if (us < 0) us = 0;
   uint32_t duty = (uint32_t)((uint64_t)us * 16384u / 20000u);
@@ -256,12 +257,160 @@ void         fm_analog_setup(void) {
   analogSetAttenuation(ADC_11db);
 #endif
 }
-void         fm_pin_mode(int pin, int mode) {   // 0=INPUT 1=OUTPUT 2=INPUT_PULLUP
-  pinMode((uint8_t)pin, mode == 1 ? OUTPUT : (mode == 2 ? INPUT_PULLUP : INPUT));
+void         fm_pin_mode(int pin, int mode) {   // 0=INPUT 1=OUTPUT 2=INPUT_PULLUP 3=INPUT_PULLDOWN
+  pinMode((uint8_t)pin, mode == 1 ? OUTPUT
+                      : (mode == 2 ? INPUT_PULLUP
+                      : (mode == 3 ? INPUT_PULLDOWN : INPUT)));
 }
 unsigned     fm_millis(void)             { return (unsigned)millis(); }
 void         fm_delay_ms(unsigned m)     { delay(m); }
 void         fm_delay_us(unsigned u)     { delayMicroseconds(u); }
+
+/* ==== ESP32 pin-mode extensions ========================================== */
+int32_t      fm_touch_read(int32_t pin)  { return (int32_t)touchRead((uint8_t)pin); }
+void         fm_dac_write(int32_t pin, int32_t v) {
+  if (v < 0) v = 0;
+  if (v > 255) v = 255;
+  dacWrite((uint8_t)pin, (uint8_t)v);
+}
+/* PWM_CONFIG pins bypass the Arduino core's LEDC layer entirely: the core's
+   analogWrite* / ledcChangeFrequency retune paths proved flaky on hardware
+   (different melody notes died on different runs). Each configured pin gets
+   its own IDF-direct LOW-SPEED timer+channel, allocated from the TOP of the
+   range so the core's own bottom-up allocation (servo, plain .pwm analogWrite)
+   never collides until 12+ simultaneous channels. Retune = ledc_set_freq only.
+   (fm_ledc_on above is the servo ledger for the core-managed channels.) */
+#include "driver/ledc.h"
+#define FM_LEDC_SLOTS 4
+static int fm_ledc_pin[FM_LEDC_SLOTS] = { -1, -1, -1, -1 };
+static int fm_ledc_res[FM_LEDC_SLOTS] = { 8, 8, 8, 8 };
+static int fm_ledc_slot_of(int pin) {
+  for (int i = 0; i < FM_LEDC_SLOTS; i++) if (fm_ledc_pin[i] == pin) return i;
+  return -1;
+}
+static void fm_ledc_timer_init(int slot, int32_t freq_hz, int32_t res_bits) {
+  ledc_timer_config_t t = {};
+  t.speed_mode      = LEDC_LOW_SPEED_MODE;
+  t.duty_resolution = (ledc_timer_bit_t)res_bits;
+  t.timer_num       = (ledc_timer_t)(3 - slot);
+  t.freq_hz         = (uint32_t)freq_hz;
+  t.clk_cfg         = LEDC_AUTO_CLK;
+  ledc_timer_config(&t);
+}
+bool fm_ledc_on[SOC_GPIO_PIN_COUNT] = { false };
+void         fm_ledc_config(int32_t pin, int32_t freq_hz, int32_t res_bits) {
+  if (res_bits < 1) res_bits = 1;
+  if (res_bits > 14) res_bits = 14;
+  int slot = fm_ledc_slot_of((int)pin);
+  if (slot < 0) {                                      // first config: claim a slot
+    for (int i = 0; i < FM_LEDC_SLOTS; i++) if (fm_ledc_pin[i] < 0) { slot = i; break; }
+    if (slot < 0) return;                              // all 4 slots busy
+    fm_ledc_pin[slot] = (int)pin;
+    fm_ledc_res[slot] = (int)res_bits;
+    fm_ledc_timer_init(slot, freq_hz, res_bits);
+    ledc_channel_config_t c = {};
+    c.gpio_num   = (int)pin;
+    c.speed_mode = LEDC_LOW_SPEED_MODE;
+    c.channel    = (ledc_channel_t)(7 - slot);
+    c.intr_type  = LEDC_INTR_DISABLE;
+    c.timer_sel  = (ledc_timer_t)(3 - slot);
+    c.duty       = 0;
+    c.hpoint     = 0;
+    ledc_channel_config(&c);
+  } else if ((int)res_bits != fm_ledc_res[slot]) {     // resolution change: re-init timer
+    fm_ledc_res[slot] = (int)res_bits;
+    fm_ledc_timer_init(slot, freq_hz, res_bits);
+  } else {                                             // retune only — deterministic
+    ledc_set_freq(LEDC_LOW_SPEED_MODE, (ledc_timer_t)(3 - slot), (uint32_t)freq_hz);
+  }
+}
+
+/* Duty write that routes PWM_CONFIG-managed pins to their IDF channel and
+   everything else through the Arduino core's analogWrite. */
+void         fm_pwm_write(int32_t pin, int32_t duty) {
+  int slot = fm_ledc_slot_of((int)pin);
+  if (slot >= 0) {
+    // duty == max -> write max+1: LEDC's constant-high point (true 100%, no spike train)
+    uint32_t d = (uint32_t)duty;
+    uint32_t max = (1u << fm_ledc_res[slot]) - 1u;
+    if (d >= max) d = max + 1u;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)(7 - slot), d);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)(7 - slot));
+  } else {
+    analogWrite((uint8_t)pin, (int)duty);
+  }
+}
+
+/* ==== Module hardware primitives (sonar / DHT) =========================== */
+/* HC-SR04: 10 us trigger pulse, then measure the echo-high width. Blocking up
+   to timeout_us (~25 ms at 4 m) — acceptable once per handle()/tick(). */
+int32_t      fm_sonar_ping_us(int32_t trig, int32_t echo, int32_t timeout_us) {
+  digitalWrite((uint8_t)trig, LOW);  delayMicroseconds(2);
+  digitalWrite((uint8_t)trig, HIGH); delayMicroseconds(10);
+  digitalWrite((uint8_t)trig, LOW);
+  unsigned long us = pulseIn((uint8_t)echo, HIGH, (unsigned long)timeout_us);
+  return (int32_t)us;                       // 0 on timeout
+}
+
+/* DHT11/22 bit-bang read (type 0=DHT11, 1=DHT22). 40 bits, bit value decided by
+   the high-pulse width (~26-28 us = 0, ~70 us = 1). Returns 0 ok, -1 fail.
+   Timing-critical: the line release and every sample use DIRECT GPIO registers
+   (Arduino pinMode/digitalRead can burn >100 us in peripheral bookkeeping, which
+   desynchronises the 26-70 us bit stream), and the whole ~4 ms window runs with
+   interrupts masked. Direct-register path covers GPIO 0-31 (use those pins). */
+#include "soc/gpio_struct.h"
+static inline int dhtLvl(uint32_t bit) { return (GPIO.in & bit) ? 1 : 0; }
+static int dhtWaitBit(uint32_t bit, int level, uint32_t timeout_us) {
+  uint32_t t0 = micros();
+  while (dhtLvl(bit) != level) {
+    if ((uint32_t)(micros() - t0) > timeout_us) return -1;
+  }
+  return (int)(uint32_t)(micros() - t0);
+}
+int32_t      fm_dht_read(int32_t pin32, int32_t type, float *temp_c, float *hum_pct) {
+  if (pin32 < 0 || pin32 >= 32) return -1;             // direct-reg path: GPIO 0-31
+  uint8_t pin = (uint8_t)pin32;
+  uint32_t bit = 1UL << pin;
+  uint8_t data[5] = {0, 0, 0, 0, 0};
+
+  // Configure pull-up once; drive the start signal via direct output-enable.
+  pinMode(pin, INPUT_PULLUP);
+  GPIO.out_w1tc = bit;                                 // latched LOW when output enables
+  GPIO.enable_w1ts = bit;                              // drive low (start signal)
+  delay(20);                                           // >=18 ms covers DHT11 and DHT22
+
+  static portMUX_TYPE dhtMux = portMUX_INITIALIZER_UNLOCKED;
+  bool fail = false;
+  taskENTER_CRITICAL(&dhtMux);
+  GPIO.enable_w1tc = bit;                              // release: pull-up snaps high (~ns)
+  // Sensor response: low within 20-40 us, then ~80 us low / ~80 us high, then 40 bits.
+  if (dhtWaitBit(bit, 0, 90)  < 0 ||
+      dhtWaitBit(bit, 1, 120) < 0 ||
+      dhtWaitBit(bit, 0, 120) < 0) {
+    fail = true;
+  } else {
+    for (int i = 0; i < 40; i++) {
+      if (dhtWaitBit(bit, 1, 80) < 0) { fail = true; break; }        // ~50 us low preamble
+      int high = dhtWaitBit(bit, 0, 110);                            // bit = high-pulse width
+      if (high < 0) { fail = true; break; }
+      data[i / 8] <<= 1;
+      if (high > 45) data[i / 8] |= 1;                               // ~26 us = 0, ~70 us = 1
+    }
+  }
+  taskEXIT_CRITICAL(&dhtMux);
+  if (fail) return -1;
+  if ((uint8_t)(data[0] + data[1] + data[2] + data[3]) != data[4]) return -1;
+
+  if (type == 0) {                                     // DHT11: integral bytes
+    *hum_pct = (float)data[0] + (float)data[1] * 0.1f;
+    *temp_c  = (float)data[2] + (float)(data[3] & 0x7F) * 0.1f;
+  } else {                                             // DHT22: 10ths, sign bit on temp
+    *hum_pct = ((float)(((uint16_t)data[0] << 8) | data[1])) * 0.1f;
+    float t  = ((float)(((uint16_t)(data[2] & 0x7F) << 8) | data[3])) * 0.1f;
+    *temp_c  = (data[2] & 0x80) ? -t : t;
+  }
+  return 0;
+}
 
 // I2C (Wire)
 void fm_i2c_begin(int sda, int scl)       { Wire.begin((uint8_t)sda, (uint8_t)scl); }

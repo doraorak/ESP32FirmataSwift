@@ -17,3 +17,6 @@ dependencies.lock
 # build logs
 fw-build.log
 fw-flash.log
+
+# clangd index
+.cache/
