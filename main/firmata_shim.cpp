@@ -197,17 +197,28 @@ static size_t     fm_rx_len = 0;
 static bool       fm_rx_armed = false;
 static int        fm_rx_pin = -1;
 
-int32_t fm_rmt_rx_init(int32_t pin) {
-  if (!rmtInit((int)pin, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) { fm_rx_status = 2; return 0; }
-  rmtSetRxMaxThreshold((int)pin, 12000);   // 12 ms idle ends a frame
+// (Re)configure the RX peripheral on `pin` and start an async read. Used both for the
+// first arm and to re-arm after each captured frame: a bare rmtReadAsync re-arm did NOT
+// reliably re-trigger rmtReceiveCompleted (only the first frame per arming was ever seen),
+// so re-running the full init gives a clean state for every subsequent frame.
+static bool fm_rx_start(int pin) {
+  rmtDeinit(pin);   // free any RMT channel already on this pin — re-init after every frame
+                    // would otherwise leak channels and reception dies after a few presses
+  if (!rmtInit(pin, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) return false;
+  rmtSetRxMaxThreshold(pin, 12000);   // 12 ms idle ends a frame
   // Glitch filter runs on the 80 MHz source clock (8-bit, max ~255 cycles ~= 3.2 us),
-  // NOT the 1 MHz resolution clock. A larger value makes rmt_receive() reject the
-  // config and reception silently never starts. 2 us is safely under the limit.
-  rmtSetRxMinThreshold((int)pin, 2);       // ignore sub-2 us glitches
-  fm_rx_pin = (int)pin;
+  // NOT the 1 MHz resolution clock. A larger value makes rmt_receive() reject the config
+  // and reception silently never starts. 2 us is safely under the limit.
+  rmtSetRxMinThreshold(pin, 2);       // ignore sub-2 us glitches
+  fm_rx_pin = pin;
   fm_rx_len = sizeof(fm_rx_buf) / sizeof(fm_rx_buf[0]);
-  fm_rx_armed = rmtReadAsync(fm_rx_pin, fm_rx_buf, &fm_rx_len);
-  fm_rx_status = fm_rx_armed ? 1 : 3;
+  fm_rx_armed = rmtReadAsync(pin, fm_rx_buf, &fm_rx_len);
+  return fm_rx_armed;
+}
+
+int32_t fm_rmt_rx_init(int32_t pin) {
+  fm_rx_armed = fm_rx_start((int)pin);
+  fm_rx_status = fm_rx_armed ? 1 : 2;
   return fm_rx_armed ? 1 : 0;
 }
 
@@ -231,8 +242,7 @@ int32_t fm_rmt_rx_poll(int32_t *out, int32_t maxCount) {
     out[n++] = (int32_t)fm_rx_buf[i].duration0;
     out[n++] = (int32_t)fm_rx_buf[i].duration1;
   }
-  fm_rx_len = sizeof(fm_rx_buf) / sizeof(fm_rx_buf[0]);
-  fm_rx_armed = rmtReadAsync(fm_rx_pin, fm_rx_buf, &fm_rx_len);
+  fm_rx_start(fm_rx_pin);   // full re-init: reliably re-arms for the NEXT frame (repeated presses)
   return n;
 }
 

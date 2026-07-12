@@ -8,23 +8,26 @@
      0x02 <pin> <dstReg> [<protocol>]  start RX; each decoded frame → R[dstReg], event 0x03.
                              protocol 0 = NEC (default, omitted byte = old wire form),
                              1 = RC6 mode 0, 2 = Coolix (Midea AC family, 24-bit).
-                             All three decode the SAME raw RMT capture the sniffer sees.
+                             All decode the SAME raw RMT capture the sniffer sees.
      0x03 <kHz> <durations>  raw send (host-encoded NEC/RC6/any protocol)
      0x04 …                  repeat/hold send (frame A / optional toggle frame B)
      0x05 <protocol> <srcReg> encode a code held in a register on-device (NEC/RC6) and send
      0x06 <pin> <enable>     raw capture: push EVERY received burst as event 0x07
                              <totalLo> <totalHi> <durations, 14-bit LE pairs> — protocol
-                             sniffing for remotes the NEC decoder can't read (AC units etc.) */
+                             sniffing for remotes the NEC decoder can't read (AC units etc.)
+     0x08 <pin> <slot>       receive raw timings as the TEXT "[d0,d1,…]" into device string
+                             <slot> — printable on the OLED / inspectable to learn a protocol */
 final class IRModuleHandler: ModuleHandler {
   let id: UInt8 = 0x01
   let major: UInt8 = 1
-  let minor: UInt8 = 2
+  let minor: UInt8 = 3
   let name: StaticString = "ir"
 
   var txPin: Int32 = -1
   var rxPin: Int32 = -1
   var dstReg = 0
   var rxProtocol: UInt8 = 0                         // 0 NEC, 1 RC6, 2 Coolix
+  var rawTextSlot: Int = -1                        // op 0x08: format each burst as text into this slot
   var rawReport = false                             // op 0x06: mirror captures to the host
   var rxBuf = [Int32](repeating: 0, count: 256)    // reused; no per-tick allocation
   var rawBuf = [Int32](repeating: 0, count: 224)   // staged send durations — sized for a
@@ -143,6 +146,15 @@ final class IRModuleHandler: ModuleHandler {
     return count
   }
 
+  // SYSTEM_RESET forgets the receiver: `systemResetState()` reset every pin to input mode,
+  // which detached the RMT receiver — so drop rxPin/rawTextSlot and let the next receive op
+  // re-arm (the arm is pin-change-gated, so without this it would wrongly skip re-init).
+  func reset() {
+    rxPin = -1
+    rawTextSlot = -1
+    rawReport = false
+  }
+
   func handle(_ payload: [UInt8], _ length: Int) {
     if length < 1 { return }
     switch payload[0] {
@@ -150,10 +162,16 @@ final class IRModuleHandler: ModuleHandler {
       // Configure the TX pin. The carrier is set per send by the raw op (0x03).
       if length >= 2 && fm_rmt_tx_init(Int32(payload[1] & 0x7F), 0) != 0 { txPin = Int32(payload[1] & 0x7F) }
     case 0x02:
-      if length >= 3 && fm_rmt_rx_init(Int32(payload[1] & 0x7F)) != 0 {
-        rxPin = Int32(payload[1] & 0x7F)
-        dstReg = Int(payload[2] & REG_MASK)
-        rxProtocol = length >= 4 ? payload[3] & 0x7F : 0
+      // Arm the receiver only when the pin actually changes — re-running this op (e.g. every
+      // pass of a repeating task) then just updates the register/protocol without a re-init
+      // that would drop a frame mid-capture.
+      if length >= 3 {
+        let pin = Int32(payload[1] & 0x7F)
+        if rxPin != pin && fm_rmt_rx_init(pin) != 0 { rxPin = pin }
+        if rxPin == pin {
+          dstReg = Int(payload[2] & REG_MASK)
+          rxProtocol = length >= 4 ? payload[3] & 0x7F : 0
+        }
       }
     case 0x03:
       // Raw send: <carrierKHz> <duration pairs as 14-bit LE>. Marks HIGH; carrierKHz 0 = no
@@ -196,6 +214,16 @@ final class IRModuleHandler: ModuleHandler {
         else { txCount = encodeNEC(code) }
         txNA = txCount
         txFrame(0)
+      }
+    case 0x08:
+      // Receive raw timings as TEXT into a device string slot: <pin> <slot>. Each burst is
+      // formatted "[d0,d1,d2,…]" into the slot — printable on the OLED (displayPrint string)
+      // or inspectable, so an unknown remote's protocol can be read off directly. Arm only on
+      // a pin change so re-running the op each pass never resets a capture in progress.
+      if length >= 3 {
+        let pin = Int32(payload[1] & 0x7F)
+        if rxPin != pin && fm_rmt_rx_init(pin) != 0 { rxPin = pin }
+        if rxPin == pin { rawTextSlot = Int(payload[2] & 0x7F) }
       }
     case 0x06:
       // Raw capture on/off. Enabling (re)arms the receiver on <pin>; NEC decode keeps
@@ -281,6 +309,9 @@ final class IRModuleHandler: ModuleHandler {
     #endif
     // All protocols decode the same raw capture the sniffer sees (op 0x02's protocol byte
     // picks the decoder; a burst that doesn't parse is simply ignored).
+    // Only format a REAL burst (poll returns 0 between frames — formatting those would
+    // overwrite the capture with "[]" microseconds later).
+    if rawTextSlot >= 0 && captureCount >= 6 { formatRawText(Int(captureCount)) }
     switch rxProtocol {
     case 1:  decodeRC6Capture(Int(captureCount))
     case 2:  decodeCoolixCapture(Int(captureCount))
@@ -351,6 +382,32 @@ final class IRModuleHandler: ModuleHandler {
     emitReceived(code)
   }
 
+  /// Format a raw capture as the ASCII string "[d0,d1,d2,…]" into device string `rawTextSlot`.
+  /// Capped at ~500 bytes (≈90 durations) — enough for a full NEC frame and the header + lead
+  /// bits of longer AC frames, which is what fingerprints a protocol. Reuses `frameBuf` as scratch.
+  func formatRawText(_ count: Int) {
+    var out = 0
+    func put(_ b: UInt8) { if out < 500 { frameBuf[out] = b; out += 1 } }
+    func putNum(_ v: Int32) {
+      if v == 0 { put(0x30); return }
+      var digits = [UInt8](repeating: 0, count: 10)
+      var n = 0, x = v < 0 ? 0 : v
+      while x > 0 && n < 10 { digits[n] = UInt8(0x30 + Int(x % 10)); x /= 10; n += 1 }
+      while n > 0 { n -= 1; put(digits[n]) }
+    }
+    put(0x5B)                                        // '['
+    var i = 0
+    while i < count && out < 495 {
+      if i > 0 { put(0x2C) }                         // ','
+      var d = rxBuf[i]
+      if d < 0 { d = 0 }
+      putNum(d)
+      i += 1
+    }
+    put(0x5D)                                        // ']'
+    _ = frameBuf.withUnsafeBufferPointer { fm_snapshot_copy(Int32(rawTextSlot), $0.baseAddress!, Int32(out)) }
+  }
+
   /// RC6 mode 0: 6t/2t leader (t = 444 µs), a `1` start bit, then Manchester bits with the
   /// 4th one double-width (the toggle). Durations are converted to half-bit units and the
   /// unit stream is walked bit by bit; 16–32 decoded bits (incl. mode+toggle) = a frame —
@@ -390,6 +447,13 @@ final class IRModuleHandler: ModuleHandler {
       if !halvesValid || unitLevel[p] == unitLevel[p + width] { break }
       code = (code << 1) | (unitLevel[p] ? 1 : 0)
       p += 2 * width
+      bitsRead += 1
+    }
+    // A frame whose LAST bit is a 1 ends mark-then-space — that final space merges into
+    // the idle gap and is never captured, leaving a lone trailing mark half-unit. Infer
+    // the bit (vol-down 0x11 decoded as 0x8 without this; …0 frames end on a captured mark).
+    if bitsRead < 32 && p < unitCount && unitLevel[p] {
+      code = (code << 1) | 1
       bitsRead += 1
     }
     if bitsRead < 16 { return }

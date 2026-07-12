@@ -18,6 +18,7 @@ func systemResetState() {
     pinValues[pin] = 0
     pinConfigured[pin] = false
   }
+  moduleReset()          // the pin-mode reset above detaches RMT receivers — let modules re-arm
   samplingInterval = 19
 }
 

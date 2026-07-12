@@ -59,7 +59,12 @@ protocol ModuleHandler: AnyObject {
   var name: StaticString { get }
   func handle(_ payload: [UInt8], _ length: Int)
   func tick()
+  /// Drop any peripheral state on SYSTEM_RESET. Needed because `systemResetState()` sets
+  /// every pin back to input mode — which detaches an RMT receiver from its pin — so a
+  /// module holding a receiver must forget it and re-arm on the next op.
+  func reset()
 }
+extension ModuleHandler { func reset() {} }
 
 /* Every compiled-in module, in one place. */
 let modules: [ModuleHandler] = [
@@ -75,6 +80,10 @@ func moduleDispatch(_ id: UInt8, _ payload: [UInt8], _ count: Int) {
 
 func moduleTick() {
   for module in modules { module.tick() }
+}
+
+func moduleReset() {
+  for module in modules { module.reset() }
 }
 
 func handleModuleData(_ data: [UInt8], _ length: Int) {
