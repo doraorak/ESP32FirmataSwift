@@ -14,7 +14,7 @@ struct ParserState {
 }
 
 let MAX_TASKS = 8
-let MAX_TASK_BYTES = 512
+let MAX_TASK_BYTES = 4096
 let MAX_LOOP_DEPTH = 4          // per-task counted-loop nesting (SCHED_EXT_LOOP)
 
 final class SchedTask {
@@ -71,7 +71,7 @@ let liveHandler   = FirmataProtocol()
 let replayHandler = FirmataProtocol()
 
 // Scratch buffer used to build outgoing frames (sized for HTTP response bodies).
-var frameBuf = [UInt8](repeating: 0, count: 2048)
+var frameBuf = [UInt8](repeating: 0, count: 5120)   // holds a full 4096-byte task 8/7-encoded (queryTask reply)
 // Max response bytes retained on-device for JSON/string inspection ops AND
 // echoed back to a connected host (so the host can parse the full body).
 let HTTP_PARSE_MAX = 4096
