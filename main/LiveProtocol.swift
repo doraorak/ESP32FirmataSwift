@@ -33,9 +33,22 @@ final class FirmataProtocol {
     pinValues[pin] = v
   }
 
+  /* Tone out (.tone pin): a 50 %-duty LEDC square wave at `hz` (0 = silence). */
+  func toneOut(_ pin: Int, _ hz: Int) {
+    if hz > 0 {
+      fm_ledc_config(Int32(pin), Int32(hz), 8)   // carrier frequency = the pitch
+      pwmMaxDuty[pin] = 255
+      pwm(pin, 128)                               // 50 % duty
+    } else {
+      pwm(pin, 0)
+    }
+    pinValues[pin] = hz
+  }
+
   func handleSetPinMode(_ pin: Int, _ mode: UInt8) {
     if pin >= TOTAL_PINS { return }
     if pinModes[pin] == PIN_MODE_SERVO && mode != PIN_MODE_SERVO { fm_servo_detach(Int32(pin)) }
+    if pinModes[pin] == PIN_MODE_TONE  && mode != PIN_MODE_TONE  { pwm(pin, 0); clearToneTimer(pin) }
     switch mode {
     case PIN_MODE_INPUT:
       if isUsable(pin) { fm_pin_mode(Int32(pin), 0); pinModes[pin] = mode; pinConfigured[pin] = true }
@@ -62,9 +75,24 @@ final class FirmataProtocol {
       if touchSensorOfPin(pin) >= 0 { pinModes[pin] = mode }
     case PIN_MODE_DAC:
       if isDACPin(pin) { pinModes[pin] = mode; dacOut(pin, 0) }
+    case PIN_MODE_TONE:
+      if isFullDigital(pin) { pinModes[pin] = mode; pwmMaxDuty[pin] = 255; pinValues[pin] = 0; pinConfigured[pin] = true }
     default:
       break
     }
+  }
+
+  /* TONE_CONFIG (0x0B): <pin> <freq:14-bit LE> <dur:14-bit LE>. Plays a square wave at
+     `freq` on a `.tone` pin (mode-gated, like analogWrite → PWM); `dur` ms auto-stops via
+     the tone timers, `dur == 0` is continuous, `freq == 0` stops immediately. */
+  func handleTone(_ data: [UInt8], _ len: Int) {
+    if len < 5 { return }
+    let pin = Int(data[0])
+    if pin >= TOTAL_PINS || pinModes[pin] != PIN_MODE_TONE { return }
+    let hz  = Int(data[1] & 0x7F) | (Int(data[2] & 0x7F) << 7)
+    let dur = UInt32(data[3] & 0x7F) | (UInt32(data[4] & 0x7F) << 7)
+    toneOut(pin, hz)
+    if hz > 0 && dur > 0 { setToneTimer(pin, dur) } else { clearToneTimer(pin) }
   }
 
   /* PWM_CONFIG (0x0E): pin, frequency Hz (3 × 7-bit LE, up to ~2 MHz), duty resolution
@@ -247,6 +275,7 @@ final class FirmataProtocol {
     case STRING_DATA:          handleString(data, dlen)
     case SERVO_CONFIG:         handleServoConfig(data, dlen)
     case PWM_CONFIG:           handlePwmConfig(data, dlen)
+    case TONE_CONFIG:          handleTone(data, dlen)
     case I2C_CONFIG:           handleI2CConfig(data, dlen)
     case I2C_REQUEST:          handleI2CRequest(data, dlen)
     case SCHEDULER_DATA:       sched.handleSysex(data, dlen)

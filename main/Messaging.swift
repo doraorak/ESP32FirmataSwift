@@ -58,7 +58,10 @@ func sendAnalogMappingResponse() {
   frameBuf[n] = START_SYSEX;             n += 1
   frameBuf[n] = ANALOG_MAPPING_RESPONSE; n += 1
   for pin in 0..<TOTAL_PINS {
-    let ch = analogChannelOfPin(pin)
+    var ch = analogChannelOfPin(pin)
+    // Touch pins with no ADC channel report their touch channel (6–15), so the host
+    // can read them via analogRead(channel:) / touchRead(pin:).
+    if ch < 0, touchSensorOfPin(pin) >= 0 { ch = TOUCH_CHANNEL_BASE + touchSensorOfPin(pin) }
     frameBuf[n] = (ch >= 0) ? UInt8(ch) : 0x7F; n += 1
   }
   frameBuf[n] = END_SYSEX; n += 1

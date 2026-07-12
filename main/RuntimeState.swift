@@ -90,3 +90,27 @@ var activeTransport: UInt8 = TR_NONE
   let v = value < 0 ? 0 : (value > hi ? hi : value)
   fm_pwm_write(Int32(pin), Int32(v))   // routes PWM_CONFIG pins to their IDF channel
 }
+
+/* ==== Tone (.tone pin mode): a 50 %-duty square wave at a given Hz on a LEDC pin.
+   TONE_CONFIG may pass a duration; the firmware auto-stops via these per-pin timers
+   (0 = no timer). `toneTimersActive` lets the tick skip the scan when none pending. ==== */
+var toneOffMs = [UInt32](repeating: 0, count: TOTAL_PINS)
+var toneTimersActive = 0
+
+func setToneTimer(_ pin: Int, _ durMs: UInt32) {
+  if toneOffMs[pin] == 0 { toneTimersActive += 1 }
+  var off = fm_millis() &+ durMs
+  if off == 0 { off = 1 }            // 0 is the "no timer" sentinel
+  toneOffMs[pin] = off
+}
+func clearToneTimer(_ pin: Int) {
+  if toneOffMs[pin] != 0 { toneTimersActive -= 1; toneOffMs[pin] = 0 }
+}
+/// Stop any tones whose timer has elapsed. Cheap when no timers are pending.
+func toneTick() {
+  if toneTimersActive == 0 { return }
+  let now = fm_millis()
+  for pin in 0..<TOTAL_PINS where toneOffMs[pin] != 0 {
+    if Int32(bitPattern: now &- toneOffMs[pin]) >= 0 { pwm(pin, 0); pinValues[pin] = 0; clearToneTimer(pin) }
+  }
+}

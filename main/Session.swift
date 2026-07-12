@@ -19,6 +19,7 @@ func systemResetState() {
     pinConfigured[pin] = false
   }
   moduleReset()          // the pin-mode reset above detaches RMT receivers — let modules re-arm
+  for pin in 0..<TOTAL_PINS { toneOffMs[pin] = 0 }; toneTimersActive = 0   // the pin reset stopped any tones
   samplingInterval = 19
 }
 
@@ -56,6 +57,7 @@ func transportConnected() -> Bool { activeTransport != TR_NONE }
 func loopTick() {
   scheduler.tick()
   moduleTick()
+  toneTick()                 // auto-stop any timed tones (cheap when none pending)
   if transportConnected() {
     checkDigitalInputs()
     let now = fm_millis()

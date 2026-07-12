@@ -3,7 +3,7 @@
 /* ==== Firmware identity (firmware-report message) ======================= */
 let FIRMWARE_NAME: StaticString = "swiftFirmataESP32"
 let FIRMWARE_MAJOR: UInt8 = 2
-let FIRMWARE_MINOR: UInt8 = 20
+let FIRMWARE_MINOR: UInt8 = 21
 let PROTOCOL_MAJOR: UInt8 = 2
 let PROTOCOL_MINOR: UInt8 = 8
 
@@ -38,6 +38,7 @@ let SCHEDULER_DATA: UInt8          = 0x7B
 // Encrypted Wi-Fi provisioning (non-standard; top-level user-range SysEx 0x0C).
 let MODULE_DATA: UInt8 = 0x0D      // module subsystem (user-range SysEx)
 let PWM_CONFIG: UInt8 = 0x0E       // per-pin LEDC freq/resolution (user-range SysEx)
+let TONE_CONFIG: UInt8 = 0x0B      // <pin> <freq:14b> <dur:14b>: tone on a .tone pin (dur 0 = continuous)
 let MODULE_QUERY: UInt8 = 0x00
 let MODULE_LIST_REPLY: UInt8 = 0x7F
 let WIFI_CONFIG: UInt8 = 0x0C
@@ -126,6 +127,7 @@ let PIN_MODE_PWM: UInt8    = 0x03
 let PIN_MODE_SERVO: UInt8  = 0x04
 let PIN_MODE_I2C: UInt8    = 0x06
 let PIN_MODE_PULLUP: UInt8 = 0x0B
+let PIN_MODE_TONE: UInt8   = 0x0E   // square-wave tone out (LEDC); write via TONE_CONFIG
 // ESP32 extensions (block 0x10+, clear of the standard table)
 let PIN_MODE_PULLDOWN: UInt8 = 0x10   // internal pull-down (full-digital pins only)
 let PIN_MODE_TOUCH: UInt8    = 0x11   // capacitive touch — reads via analog channels 6–15
