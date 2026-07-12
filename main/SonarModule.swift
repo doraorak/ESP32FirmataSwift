@@ -10,7 +10,7 @@
 final class SonarModuleHandler: ModuleHandler {
   let id: UInt8 = 0x02
   let major: UInt8 = 1
-  let minor: UInt8 = 0
+  let minor: UInt8 = 1              // 1.1: op 0x03 one-shot ping → host reply
   let name: StaticString = "sonar"
 
   var trigPin: Int32 = -1
@@ -44,6 +44,12 @@ final class SonarModuleHandler: ModuleHandler {
         autoPeriodMs = UInt32(payload[2] & 0x7F) | (UInt32(payload[3] & 0x7F) << 7)
         nextPingMs = fm_millis()
       }
+    case 0x03:                        // one-shot: ping now, reply cm to the host (no register)
+      var out: [UInt8] = [START_SYSEX, MODULE_DATA, id, 0x03]
+      var v = UInt32(bitPattern: pingCm())        // cm (-1 = no echo) as 5×7-bit limbs
+      for _ in 0..<5 { out.append(UInt8(v & 0x7F)); v >>= 7 }
+      out.append(END_SYSEX)
+      sendFrame(out, out.count)
     default: break
     }
   }

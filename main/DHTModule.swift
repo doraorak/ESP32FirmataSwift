@@ -12,7 +12,7 @@
 final class DHTModuleHandler: ModuleHandler {
   let id: UInt8 = 0x03
   let major: UInt8 = 1
-  let minor: UInt8 = 0
+  let minor: UInt8 = 1              // 1.1: op 0x02 one-shot read → host reply
   let name: StaticString = "dht"
 
   var pin: Int32 = -1
@@ -35,8 +35,18 @@ final class DHTModuleHandler: ModuleHandler {
         statusReg  = Int(payload[5] & REG_MASK)
         nextReadMs = fm_millis()      // first read on the next tick
       }
-    case 0x01:                        // read now
+    case 0x01:                        // read now (auto-read path; updates registers next tick)
       nextReadMs = fm_millis()
+    case 0x02:                        // one-shot: read now, reply temp+humidity+status to host
+      var t: Float = 0, h: Float = 0
+      let ok: UInt8 = (pin >= 0 && fm_dht_read(pin, sensorType, &t, &h) == 0) ? 1 : 0
+      var out: [UInt8] = [START_SYSEX, MODULE_DATA, id, 0x02, ok]
+      var tb = t.bitPattern                       // °C  as 5×7-bit limbs of the IEEE-754 bits
+      for _ in 0..<5 { out.append(UInt8(tb & 0x7F)); tb >>= 7 }
+      var hb = h.bitPattern                       // %RH as 5×7-bit limbs
+      for _ in 0..<5 { out.append(UInt8(hb & 0x7F)); hb >>= 7 }
+      out.append(END_SYSEX)
+      sendFrame(out, out.count)
     default: break
     }
   }
