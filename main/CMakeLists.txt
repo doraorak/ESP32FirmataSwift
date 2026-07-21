@@ -55,6 +55,7 @@ set(SWIFT_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/SonarModule.swift"
     "${CMAKE_CURRENT_SOURCE_DIR}/DHTModule.swift"
     "${CMAKE_CURRENT_SOURCE_DIR}/DisplayModule.swift"
+    "${CMAKE_CURRENT_SOURCE_DIR}/MicModule.swift"
     "${CMAKE_CURRENT_SOURCE_DIR}/Session.swift"
     "${CMAKE_CURRENT_SOURCE_DIR}/Configuration.swift"
     "${CMAKE_CURRENT_SOURCE_DIR}/Transport.swift"

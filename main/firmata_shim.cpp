@@ -18,6 +18,7 @@
 #include "HTTPClient.h"
 #include "ESPmDNS.h"
 #include "Wire.h"
+#include "driver/i2s_std.h"    // I2S RX for digital MEMS mics (INMP441 etc.)
 
 /* IDF certificate bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y) — browser-like
    root CA set, so HTTPS certs are validated. Same approach works in the Arduino
@@ -278,6 +279,72 @@ void         fm_delay_us(unsigned u)     { delayMicroseconds(u); }
 
 /* ==== ESP32 pin-mode extensions ========================================== */
 int32_t      fm_touch_read(int32_t pin)  { return (int32_t)touchRead((uint8_t)pin); }
+float        fm_log10f(float x)          { return log10f(x); }
+
+/* ==== I2S RX for digital MEMS microphones (INMP441 / SPH0645) =============
+   A continuous DMA audio stream — far too fast/large to pass to the host raw
+   (that's why the mic module reduces it to RMS/dB on-device). Standard Philips
+   32-bit slots, mono; the INMP441 puts its 24-bit sample in the top bits, so a
+   read is shifted right 8 to recover the signed 24-bit value. L/R→GND selects
+   the LEFT slot. */
+static i2s_chan_handle_t fm_i2s_rx = NULL;
+
+int          fm_i2s_mic_begin(int bclk, int ws, int sd, int sampleRate) {
+  if (fm_i2s_rx) { i2s_channel_disable(fm_i2s_rx); i2s_del_channel(fm_i2s_rx); fm_i2s_rx = NULL; }
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+  if (i2s_new_channel(&chan_cfg, NULL, &fm_i2s_rx) != ESP_OK) return 0;
+  // STEREO on purpose: the INMP441's data lands on whichever slot its L/R pin selects,
+  // and that mapping is famously inconsistent on the ESP32. Reading both slots and taking
+  // RMS over all samples sidesteps the guessing — the silent slot just contributes zeros.
+  i2s_std_config_t std_cfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)sampleRate),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)bclk,
+      .ws   = (gpio_num_t)ws,
+      .dout = I2S_GPIO_UNUSED,
+      .din  = (gpio_num_t)sd,
+      .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+    },
+  };
+  if (i2s_channel_init_std_mode(fm_i2s_rx, &std_cfg) != ESP_OK) {
+    i2s_del_channel(fm_i2s_rx); fm_i2s_rx = NULL; return 0;
+  }
+  if (i2s_channel_enable(fm_i2s_rx) != ESP_OK) {
+    i2s_del_channel(fm_i2s_rx); fm_i2s_rx = NULL; return 0;
+  }
+  return 1;
+}
+
+float        fm_i2s_mic_rms(void) {
+  if (!fm_i2s_rx) return -1;
+  static int32_t buf[256];
+  size_t bytesRead = 0;
+  if (i2s_channel_read(fm_i2s_rx, buf, sizeof(buf), &bytesRead, 100) != ESP_OK) return -1;
+  int n = (int)(bytesRead / sizeof(int32_t));
+  if (n < 8) return -1;
+  double sum = 0, sumsq = 0;                     // DC-removed RMS over the block
+  for (int i = 0; i < n; i++) { double s = (double)(buf[i] >> 8); sum += s; sumsq += s * s; }
+  double mean = sum / n;
+  double var = sumsq / n - mean * mean;
+  if (var < 0) var = 0;
+  return (float)sqrt(var);
+}
+
+/* Diagnostic: the largest-magnitude RAW 32-bit sample in a block (pre-shift). Zero means
+   SD delivered nothing (dead/unpowered mic or a wiring fault); a large value with no RMS
+   reaction points at the bit extraction instead. */
+int32_t      fm_i2s_mic_peak_raw(void) {
+  if (!fm_i2s_rx) return -1;
+  static int32_t buf[256];
+  size_t bytesRead = 0;
+  if (i2s_channel_read(fm_i2s_rx, buf, sizeof(buf), &bytesRead, 100) != ESP_OK) return -1;
+  int n = (int)(bytesRead / sizeof(int32_t));
+  int32_t peak = 0;
+  for (int i = 0; i < n; i++) { int32_t a = buf[i] < 0 ? -buf[i] : buf[i]; if (a > peak) peak = a; }
+  return peak;
+}
 void         fm_dac_write(int32_t pin, int32_t v) {
   if (v < 0) v = 0;
   if (v > 255) v = 255;

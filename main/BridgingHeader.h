@@ -39,6 +39,10 @@ void          fm_delay_us(unsigned int us);
 
 // --- ESP32 pin-mode extensions (touch / DAC / LEDC config) ---
 int32_t       fm_touch_read(int32_t pin);                            // raw touch counts (lower = touched)
+float         fm_log10f(float x);                                     // libm log10f (mic dB math)
+int           fm_i2s_mic_begin(int bclk, int ws, int sd, int sampleRate);  // I2S MEMS mic (INMP441); 1=ok
+float         fm_i2s_mic_rms(void);                                   // DC-removed RMS of an I2S block
+int32_t       fm_i2s_mic_peak_raw(void);                             // largest raw 32-bit sample (diagnostic)
 void          fm_dac_write(int32_t pin, int32_t value);              // true analog out, 0-255 (GPIO 25/26)
 void          fm_ledc_config(int32_t pin, int32_t freq_hz, int32_t res_bits); // per-pin PWM freq/resolution
 void          fm_pwm_write(int32_t pin, int32_t duty);              // duty write (IDF channel for PWM_CONFIG pins)

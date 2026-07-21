@@ -30,10 +30,11 @@ func sampleAnalogAndI2C() {
       let pin = pinOfAnalogChannel(channel)
       if pin >= 0 { sendAnalogReport(channel, Int(analogRead(UInt8(pin)))) }
     } else {
+      // An enabled touch channel is the host asking for this sensor — report it
+      // unconditionally. `touchRead` auto-inits the pad, so don't gate on pinMode
+      // (which could silently drop reports and freeze the host's scope at "sampling").
       let pin = pinOfTouchChannel(channel)
-      if pin >= 0 && pinModes[pin] == PIN_MODE_TOUCH {
-        sendAnalogReport(channel, Int(fm_touch_read(Int32(pin))))
-      }
+      if pin >= 0 { sendAnalogReport(channel, Int(fm_touch_read(Int32(pin)))) }
     }
   }
   for index in 0..<MAX_CONT_READS where contReads[index].active {
@@ -72,6 +73,7 @@ let modules: [ModuleHandler] = [
   SonarModuleHandler(),
   DHTModuleHandler(),
   DisplayModuleHandler(),
+  MicModuleHandler(),
 ]
 
 func moduleDispatch(_ id: UInt8, _ payload: [UInt8], _ count: Int) {
