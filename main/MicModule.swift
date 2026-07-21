@@ -15,16 +15,20 @@
      0x00 <pin> <dbFReg> <rmsReg> <winLo> <winHi>            analog configure + windows (ms, ≥50)
      0x01                                                    read now → reply [0x01 ok db:5 rms:5]
      0x02 <offBits:5>                                        set calibration offset (dB, IEEE-754)
-     0x03 <bclk> <ws> <sd> <dbFReg> <rmsReg> <winLo> <winHi> I2S configure (INMP441) + windows
+     0x03 <bclk> <ws> <sd> <dbFReg> <rmsReg> <winLo> <winHi> [<rate:3>]  I2S configure (INMP441);
+                                                             optional 3×7-bit sample rate (default 16 kHz)
+     0x05 <hzFReg | 0x7F>                                    I2S dominant-frequency (FFT) → F[hzFReg]; 0x7F = off
    A window's burst blocks ~16 ms — same class as a sonar ping, fine at tick cadence. */
 final class MicModuleHandler: ModuleHandler {
   let id: UInt8 = 0x05
   let major: UInt8 = 1
-  let minor: UInt8 = 1              // 1.1: op 0x03 I2S MEMS-mic mode
+  let minor: UInt8 = 2              // 1.2: I2S sample rate + op 0x05 dominant frequency
   let name: StaticString = "mic"
 
   var pin: Int32 = -1                 // -1 = unconfigured (analog)
   var i2sMode = false                 // true = digital I2S mic (INMP441), pin ignored
+  var sampleRate: Int32 = 16000       // I2S audio rate (Hz); host-settable, drives Hz mapping
+  var hzFReg = -1                     // -1 = dominant-frequency detection off (I2S only)
   var dbFReg = 0
   var rmsReg = 0
   var windowMs: UInt32 = 250
@@ -78,15 +82,23 @@ final class MicModuleHandler: ModuleHandler {
         fm_analog_setup()             // 12-bit, full attenuation (idempotent)
         nextWindowMs = fm_millis()
       }
-    case 0x03:                        // I2S configure: bclk, ws, sd, F[db], R[rms], window ms
+    case 0x03:                        // I2S configure: bclk, ws, sd, F[db], R[rms], winLo, winHi, [rate:3]
       if length >= 8 {
         dbFReg = Int(payload[4] & FREG_MASK)
         rmsReg = Int(payload[5] & REG_MASK)
         windowMs = UInt32(payload[6] & 0x7F) | (UInt32(payload[7] & 0x7F) << 7)
         if windowMs < 50 { windowMs = 50 }
+        var rate: Int32 = 16000                     // default; optional 3×7-bit rate follows
+        if length >= 11 {
+          rate = Int32(UInt32(payload[8] & 0x7F) | (UInt32(payload[9] & 0x7F) << 7)
+                       | (UInt32(payload[10] & 0x7F) << 14))
+        }
+        if rate < 8000 { rate = 8000 }
+        if rate > 48000 { rate = 48000 }
         if fm_i2s_mic_begin(Int32(payload[1] & 0x7F), Int32(payload[2] & 0x7F),
-                            Int32(payload[3] & 0x7F), 16000) != 0 {
+                            Int32(payload[3] & 0x7F), rate) != 0 {
           i2sMode = true; pin = -1
+          sampleRate = rate
           nextWindowMs = fm_millis()
         }
       }
@@ -114,6 +126,10 @@ final class MicModuleHandler: ModuleHandler {
       for _ in 0..<5 { out.append(UInt8(p & 0x7F)); p >>= 7 }
       out.append(END_SYSEX)
       sendFrame(out, out.count)
+    case 0x05:                        // enable/disable dominant-frequency (I2S) → F[hzFReg]; 0x7F = off
+      if length >= 2 {
+        hzFReg = (payload[1] == 0x7F) ? -1 : Int(payload[1] & FREG_MASK)
+      }
     default: break
     }
   }
@@ -127,10 +143,14 @@ final class MicModuleHandler: ModuleHandler {
       scheduler.fregs[dbFReg] = decibels(rms)
       scheduler.regs[rmsReg] = Int32(rms)
     }
+    if i2sMode && hzFReg >= 0 {
+      let hz = fm_i2s_mic_dominant_hz(sampleRate)
+      if hz >= 0 { scheduler.fregs[hzFReg] = hz }   // 0 = no dominant tone; <0 = read error (skip)
+    }
     nextWindowMs = now &+ windowMs
   }
 
   func reset() {
-    pin = -1; i2sMode = false          // offsetDb kept: calibration outlives sessions
+    pin = -1; i2sMode = false; hzFReg = -1   // offsetDb kept: calibration outlives sessions
   }
 }

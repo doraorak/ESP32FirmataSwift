@@ -345,6 +345,70 @@ int32_t      fm_i2s_mic_peak_raw(void) {
   for (int i = 0; i < n; i++) { int32_t a = buf[i] < 0 ? -buf[i] : buf[i]; if (a > peak) peak = a; }
   return peak;
 }
+
+/* Dominant frequency (Hz) of the I2S mic's left channel over a 512-sample window: Hann-window +
+   radix-2 FFT, take the biggest magnitude bin, parabolically interpolate its true peak. Returns
+   0 when no bin stands out (silence/broadband noise — peak not ≥ 6× the mean), -1 on read error.
+   ~512 samples is 32 ms at 16 kHz; fine at window cadence. */
+static const int FM_FFT_N = 512;
+float        fm_i2s_mic_dominant_hz(int sampleRate) {
+  if (!fm_i2s_rx) return -1;
+  static float re[FM_FFT_N], im[FM_FFT_N];
+  static int32_t rd[256];
+  const float kTwoPi = 6.283185307179586f;
+  int got = 0, attempts = 0;
+  while (got < FM_FFT_N && attempts < 8) {                 // one DMA read is < 512 frames; collect
+    size_t br = 0;
+    if (i2s_channel_read(fm_i2s_rx, rd, sizeof(rd), &br, 100) != ESP_OK) break;
+    int frames = (int)(br / sizeof(int32_t)) / 2;          // STEREO: 2 int32 per frame
+    for (int i = 0; i < frames && got < FM_FFT_N; i++) { re[got] = (float)(rd[2 * i] >> 8); im[got] = 0.0f; got++; }
+    attempts++;
+  }
+  if (got < FM_FFT_N) return -1;
+  double mean = 0; for (int i = 0; i < FM_FFT_N; i++) mean += re[i]; mean /= FM_FFT_N;
+  for (int i = 0; i < FM_FFT_N; i++) {                     // DC-remove + Hann window
+    float w = 0.5f * (1.0f - cosf(kTwoPi * i / (FM_FFT_N - 1)));
+    re[i] = (re[i] - (float)mean) * w;
+  }
+  for (int i = 1, j = 0; i < FM_FFT_N; i++) {              // bit-reversal permutation
+    int bit = FM_FFT_N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { float t; t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (int len = 2; len <= FM_FFT_N; len <<= 1) {          // Cooley-Tukey butterflies
+    float ang = -kTwoPi / len, wlR = cosf(ang), wlI = sinf(ang);
+    for (int i = 0; i < FM_FFT_N; i += len) {
+      float wR = 1, wI = 0;
+      for (int k = 0; k < len / 2; k++) {
+        int a = i + k, b = a + len / 2;
+        float vR = re[b] * wR - im[b] * wI, vI = re[b] * wI + im[b] * wR;
+        re[b] = re[a] - vR; im[b] = im[a] - vI;
+        re[a] += vR;        im[a] += vI;
+        float nwR = wR * wlR - wI * wlI; wI = wR * wlI + wI * wlR; wR = nwR;
+      }
+    }
+  }
+  int minBin = (int)(50.0f * FM_FFT_N / sampleRate); if (minBin < 1) minBin = 1;   // ignore rumble < 50 Hz
+  int maxBin = FM_FFT_N / 2, peakBin = minBin;
+  float peakMag = -1; double magSum = 0;
+  for (int b = minBin; b < maxBin; b++) {
+    float m = re[b] * re[b] + im[b] * im[b];
+    magSum += m;
+    if (m > peakMag) { peakMag = m; peakBin = b; }
+  }
+  double meanMag = magSum / (maxBin - minBin);
+  if (peakMag < 6.0 * meanMag) return 0;                  // no bin dominates → no tone
+  float delta = 0;                                        // parabolic peak interpolation
+  if (peakBin > minBin && peakBin < maxBin - 1) {
+    float a = re[peakBin-1]*re[peakBin-1] + im[peakBin-1]*im[peakBin-1];
+    float b = peakMag;
+    float c = re[peakBin+1]*re[peakBin+1] + im[peakBin+1]*im[peakBin+1];
+    float d = a - 2*b + c;
+    if (d != 0) delta = 0.5f * (a - c) / d;
+  }
+  return (peakBin + delta) * (float)sampleRate / FM_FFT_N;
+}
 void         fm_dac_write(int32_t pin, int32_t v) {
   if (v < 0) v = 0;
   if (v > 255) v = 255;

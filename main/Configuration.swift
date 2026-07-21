@@ -4,7 +4,7 @@
 let WIFI_SSID: StaticString = "YOUR_WIFI_SSID"
 let WIFI_PASS: StaticString = "YOUR_WIFI_PASSWORD"
 let MDNS_HOST: StaticString = "firmata-wifi-esp32"
-let BLE_NAME:  StaticString = "Firmata-BLE-ESP32"
+let BLE_NAME:  StaticString = "firmata-ble-esp32"
 let TCP_PORT: Int32 = 3030
 
 // StaticString is a null-terminated literal; pass its bytes as a C string.
